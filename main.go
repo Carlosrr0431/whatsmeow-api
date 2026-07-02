@@ -44,6 +44,7 @@ type MessageEvent struct {
 	Type      string `json:"type"`
 	Timestamp int64  `json:"timestamp"`
 	IsGroup   bool   `json:"is_group"`
+	IsFromMe  bool   `json:"is_from_me"`
 	PushName  string `json:"push_name"`
 }
 
@@ -92,8 +93,10 @@ func (app *App) eventHandler(evt interface{}) {
 			To:        v.Info.Chat.String(),
 			Timestamp: v.Info.Timestamp.Unix(),
 			IsGroup:   v.Info.IsGroup,
+			IsFromMe:  v.Info.IsFromMe,
 			PushName:  v.Info.PushName,
 		}
+		fmt.Printf("[MSG] from=%s to=%s isFromMe=%v type=", msg.From, msg.To, msg.IsFromMe)
 
 		switch {
 		case v.Message.GetConversation() != "":
@@ -128,6 +131,7 @@ func (app *App) eventHandler(evt interface{}) {
 		default:
 			msg.Type = "unknown"
 		}
+		fmt.Printf("%s body_len=%d\n", msg.Type, len(msg.Body))
 
 		app.msgMu.Lock()
 		app.messages = append(app.messages, msg)
@@ -391,6 +395,8 @@ func (app *App) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	app.storeSentMessage(resp.ID, jid.String(), req.Message, "text", resp.Timestamp.Unix())
+
 	writeJSON(w, http.StatusOK, APIResponse{
 		Success: true,
 		Message: "Message sent",
@@ -470,6 +476,8 @@ func (app *App) handleSendImage(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	app.storeSentMessage(resp.ID, jid.String(), req.Caption, "image", resp.Timestamp.Unix())
 
 	writeJSON(w, http.StatusOK, APIResponse{
 		Success: true,
@@ -583,19 +591,23 @@ func (app *App) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 
 	chatFilter := r.URL.Query().Get("chat")
 	if chatFilter != "" {
+		normalizedFilter := strings.Split(chatFilter, "@")[0]
 		filtered := make([]MessageEvent, 0)
 		for _, msg := range app.messages {
-			if msg.From == chatFilter || msg.To == chatFilter ||
-				strings.Contains(msg.From, chatFilter) || strings.Contains(msg.To, chatFilter) {
+			fromUser := strings.Split(msg.From, "@")[0]
+			toUser := strings.Split(msg.To, "@")[0]
+			if fromUser == normalizedFilter || toUser == normalizedFilter ||
+				strings.Contains(msg.From, normalizedFilter) || strings.Contains(msg.To, normalizedFilter) {
 				filtered = append(filtered, msg)
 			}
 		}
 		writeJSON(w, http.StatusOK, APIResponse{
 			Success: true,
 			Data: map[string]interface{}{
-				"messages": filtered,
-				"total":    len(filtered),
-				"chat":     chatFilter,
+				"messages":       filtered,
+				"total":          len(filtered),
+				"chat":           chatFilter,
+				"total_in_memory": len(app.messages),
 			},
 		})
 		return
@@ -764,6 +776,8 @@ func (app *App) handleSendGroupMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	app.storeSentMessage(resp.ID, jid.String(), req.Message, "text", resp.Timestamp.Unix())
+
 	writeJSON(w, http.StatusOK, APIResponse{
 		Success: true,
 		Message: "Group message sent",
@@ -772,6 +786,30 @@ func (app *App) handleSendGroupMessage(w http.ResponseWriter, r *http.Request) {
 			"timestamp":  resp.Timestamp.Unix(),
 		},
 	})
+}
+
+func (app *App) storeSentMessage(id string, toJID string, body string, msgType string, timestamp int64) {
+	myJID := ""
+	if app.client != nil && app.client.Store.ID != nil {
+		myJID = app.client.Store.ID.String()
+	}
+	msg := MessageEvent{
+		ID:        id,
+		From:      myJID,
+		To:        toJID,
+		Body:      body,
+		Type:      msgType,
+		Timestamp: timestamp,
+		IsGroup:   strings.Contains(toJID, "@g.us"),
+		IsFromMe:  true,
+		PushName:  "Yo",
+	}
+	app.msgMu.Lock()
+	app.messages = append(app.messages, msg)
+	if len(app.messages) > app.maxMsgHist {
+		app.messages = app.messages[len(app.messages)-app.maxMsgHist:]
+	}
+	app.msgMu.Unlock()
 }
 
 // --- Helpers ---
