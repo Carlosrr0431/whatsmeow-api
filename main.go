@@ -768,6 +768,11 @@ func authMiddleware(next http.Handler) http.Handler {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" || r.URL.Path == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		key := r.Header.Get("X-API-Key")
 		if key == "" {
 			key = r.URL.Query().Get("api_key")
@@ -794,7 +799,10 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// Health check
+	// Health check (public, no auth required)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, APIResponse{Success: true, Message: "ok"})
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, APIResponse{
 			Success: true,

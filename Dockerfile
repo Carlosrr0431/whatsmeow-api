@@ -23,8 +23,7 @@ COPY --from=builder /app/whatsmeow-api .
 
 RUN mkdir -p /app/data
 
-ENV DB_PATH="file:/app/data/whatsapp.db?_foreign_keys=on"
-ENV PORT=8080
+ENV DB_PATH="file:/app/data/whatsapp.db?_foreign_keys=on&mode=rwc"
 
 EXPOSE 8080
 
