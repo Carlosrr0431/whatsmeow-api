@@ -1,0 +1,6 @@
+*.db
+*.db-wal
+*.db-shm
+data/
+whatsmeow-api
+whatsmeow-api.exe
