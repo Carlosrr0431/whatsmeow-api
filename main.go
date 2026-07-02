@@ -200,22 +200,48 @@ func (app *App) eventHandler(evt interface{}) {
 
 func (app *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 	app.mu.RLock()
-	defer app.mu.RUnlock()
+	qr := app.qrCode
+	client := app.client
+	connected := app.connected
+	app.mu.RUnlock()
 
 	status := "disconnected"
 	phone := ""
-	if app.connected && app.client != nil {
-		status = "connected"
-		if app.client.Store.ID != nil {
-			phone = app.client.Store.ID.User
+	hasSession := false
+
+	if client != nil {
+		if client.Store.ID != nil {
+			hasSession = true
+		}
+		if connected {
+			status = "connected"
+			if client.Store.ID != nil {
+				phone = client.Store.ID.User
+			}
+		} else if qr != "" {
+			status = "need_scan"
+		} else if hasSession {
+			status = "connecting"
+		} else {
+			status = "logged_out"
+		}
+	} else {
+		deviceStore, err := app.container.GetFirstDevice(context.Background())
+		if err == nil && deviceStore.ID != nil {
+			hasSession = true
+			status = "disconnected"
+		} else {
+			status = "logged_out"
 		}
 	}
 
 	writeJSON(w, http.StatusOK, APIResponse{
 		Success: true,
 		Data: map[string]interface{}{
-			"status": status,
-			"phone":  phone,
+			"status":      status,
+			"phone":       phone,
+			"has_session": hasSession,
+			"agent_code":  app.agentCode,
 		},
 	})
 }
