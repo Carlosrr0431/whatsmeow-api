@@ -94,10 +94,20 @@ func (app *App) eventHandler(evt interface{}) {
 			break
 		}
 
+		senderStr := v.Info.Sender.String()
+		chatStr := v.Info.Chat.String()
+		// Use SenderAlt/RecipientAlt for LID resolution
+		if v.Info.SenderAlt.User != "" {
+			senderStr = v.Info.SenderAlt.String()
+		}
+		if v.Info.Chat.Server == "lid" && v.Info.RecipientAlt.User != "" {
+			chatStr = v.Info.RecipientAlt.String()
+		}
+
 		msg := MessageEvent{
 			ID:        v.Info.ID,
-			From:      v.Info.Sender.String(),
-			To:        v.Info.Chat.String(),
+			From:      senderStr,
+			To:        chatStr,
 			Timestamp: v.Info.Timestamp.Unix(),
 			IsGroup:   v.Info.IsGroup,
 			IsFromMe:  v.Info.IsFromMe,
@@ -612,11 +622,30 @@ func (app *App) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 	chatFilter := r.URL.Query().Get("chat")
 	if chatFilter != "" {
 		normalizedFilter := strings.Split(chatFilter, "@")[0]
+
+		// Build a set of JID strings that represent this contact
+		matchJIDs := map[string]bool{
+			normalizedFilter:                       true,
+			normalizedFilter + "@s.whatsapp.net":   true,
+			normalizedFilter + "@lid":              true,
+		}
+
+		// Try to resolve LID<->phone mapping
+		if app.client != nil && app.client.Store != nil {
+			phoneJID := types.NewJID(normalizedFilter, types.DefaultUserServer)
+			lid, err := app.client.Store.LIDs.GetLIDForPN(context.Background(), phoneJID)
+			if err == nil && !lid.IsEmpty() {
+				matchJIDs[lid.String()] = true
+				matchJIDs[lid.User] = true
+			}
+		}
+
 		filtered := make([]MessageEvent, 0)
 		for _, msg := range app.messages {
 			fromUser := strings.Split(msg.From, "@")[0]
 			toUser := strings.Split(msg.To, "@")[0]
-			if fromUser == normalizedFilter || toUser == normalizedFilter ||
+			if matchJIDs[fromUser] || matchJIDs[toUser] ||
+				matchJIDs[msg.From] || matchJIDs[msg.To] ||
 				strings.Contains(msg.From, normalizedFilter) || strings.Contains(msg.To, normalizedFilter) {
 				filtered = append(filtered, msg)
 			}
@@ -624,9 +653,9 @@ func (app *App) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, APIResponse{
 			Success: true,
 			Data: map[string]interface{}{
-				"messages":       filtered,
-				"total":          len(filtered),
-				"chat":           chatFilter,
+				"messages":        filtered,
+				"total":           len(filtered),
+				"chat":            chatFilter,
 				"total_in_memory": len(app.messages),
 			},
 		})
