@@ -46,6 +46,8 @@ type MessageEvent struct {
 	IsGroup   bool   `json:"is_group"`
 	IsFromMe  bool   `json:"is_from_me"`
 	PushName  string `json:"push_name"`
+	ChatJID   string `json:"chat_jid"`
+	SenderPN  string `json:"sender_pn,omitempty"`
 }
 
 type APIResponse struct {
@@ -96,18 +98,22 @@ func (app *App) eventHandler(evt interface{}) {
 
 		senderStr := v.Info.Sender.String()
 		chatStr := v.Info.Chat.String()
-		// Use SenderAlt/RecipientAlt for LID resolution
+		senderPN := ""
+		// Resolve phone numbers from Alt fields
 		if v.Info.SenderAlt.User != "" {
-			senderStr = v.Info.SenderAlt.String()
+			senderPN = v.Info.SenderAlt.User
 		}
+		chatJID := chatStr
 		if v.Info.Chat.Server == "lid" && v.Info.RecipientAlt.User != "" {
-			chatStr = v.Info.RecipientAlt.String()
+			chatJID = v.Info.RecipientAlt.String()
 		}
 
 		msg := MessageEvent{
 			ID:        v.Info.ID,
 			From:      senderStr,
 			To:        chatStr,
+			ChatJID:   chatJID,
+			SenderPN:  senderPN,
 			Timestamp: v.Info.Timestamp.Unix(),
 			IsGroup:   v.Info.IsGroup,
 			IsFromMe:  v.Info.IsFromMe,
@@ -586,8 +592,11 @@ func (app *App) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 		for _, msg := range app.messages {
 			fromUser := strings.Split(msg.From, "@")[0]
 			toUser := strings.Split(msg.To, "@")[0]
-			if fromUser == normalizedFilter || toUser == normalizedFilter ||
-				strings.Contains(msg.From, normalizedFilter) || strings.Contains(msg.To, normalizedFilter) {
+			chatUser := strings.Split(msg.ChatJID, "@")[0]
+			if fromUser == normalizedFilter || toUser == normalizedFilter || chatUser == normalizedFilter ||
+				msg.SenderPN == normalizedFilter ||
+				strings.Contains(msg.From, normalizedFilter) || strings.Contains(msg.To, normalizedFilter) ||
+				strings.Contains(msg.ChatJID, normalizedFilter) {
 				filtered = append(filtered, msg)
 			}
 		}
