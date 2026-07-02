@@ -41,6 +41,7 @@ type MessageEvent struct {
 	From      string `json:"from"`
 	To        string `json:"to"`
 	Body      string `json:"body"`
+	Type      string `json:"type"`
 	Timestamp int64  `json:"timestamp"`
 	IsGroup   bool   `json:"is_group"`
 	PushName  string `json:"push_name"`
@@ -94,10 +95,38 @@ func (app *App) eventHandler(evt interface{}) {
 			PushName:  v.Info.PushName,
 		}
 
-		if v.Message.GetConversation() != "" {
+		switch {
+		case v.Message.GetConversation() != "":
 			msg.Body = v.Message.GetConversation()
-		} else if v.Message.GetExtendedTextMessage() != nil {
+			msg.Type = "text"
+		case v.Message.GetExtendedTextMessage() != nil:
 			msg.Body = v.Message.GetExtendedTextMessage().GetText()
+			msg.Type = "text"
+		case v.Message.GetImageMessage() != nil:
+			msg.Type = "image"
+			msg.Body = v.Message.GetImageMessage().GetCaption()
+		case v.Message.GetVideoMessage() != nil:
+			msg.Type = "video"
+			msg.Body = v.Message.GetVideoMessage().GetCaption()
+		case v.Message.GetDocumentMessage() != nil:
+			msg.Type = "document"
+			msg.Body = v.Message.GetDocumentMessage().GetFileName()
+		case v.Message.GetAudioMessage() != nil:
+			msg.Type = "audio"
+			if v.Message.GetAudioMessage().GetPTT() {
+				msg.Type = "ptt"
+			}
+		case v.Message.GetStickerMessage() != nil:
+			msg.Type = "sticker"
+		case v.Message.GetContactMessage() != nil:
+			msg.Type = "contact"
+			msg.Body = v.Message.GetContactMessage().GetDisplayName()
+		case v.Message.GetLocationMessage() != nil:
+			msg.Type = "location"
+			loc := v.Message.GetLocationMessage()
+			msg.Body = fmt.Sprintf("📍 %.6f, %.6f", loc.GetDegreesLatitude(), loc.GetDegreesLongitude())
+		default:
+			msg.Type = "unknown"
 		}
 
 		app.msgMu.Lock()
