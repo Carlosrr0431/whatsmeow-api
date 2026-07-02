@@ -2,43 +2,17 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
-	"github.com/skip2/go-qrcode"
-	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/proto/waE2E"
-	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
-	"go.mau.fi/whatsmeow/types/events"
-	waLog "go.mau.fi/whatsmeow/util/log"
-	"google.golang.org/protobuf/proto"
 )
-
-type App struct {
-	client      *whatsmeow.Client
-	container   *sqlstore.Container
-	qrCode      string
-	qrChan      <-chan whatsmeow.QRChannelItem
-	mu          sync.RWMutex
-	connected   bool
-	messages    []MessageEvent
-	msgMu       sync.RWMutex
-	maxMsgHist  int
-	webhookURL    string
-	webhookSecret string
-	agentCode     string
-	httpClient    *http.Client
-}
 
 type MessageEvent struct {
 	ID        string `json:"id"`
@@ -60,147 +34,6 @@ type APIResponse struct {
 	Data    interface{} `json:"data,omitempty"`
 }
 
-type SendMessageRequest struct {
-	Phone   string `json:"phone"`
-	Message string `json:"message"`
-}
-
-type SendImageRequest struct {
-	Phone   string `json:"phone"`
-	Image   string `json:"image"`
-	Caption string `json:"caption"`
-}
-
-func NewApp() (*App, error) {
-	dbPath := os.Getenv("DB_PATH")
-	if dbPath == "" {
-		dbPath = "file:whatsapp.db?_foreign_keys=on"
-	}
-
-	dbLog := waLog.Stdout("Database", "WARN", true)
-	container, err := sqlstore.New(context.Background(), "sqlite3", dbPath, dbLog)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create store: %v", err)
-	}
-
-	return &App{
-		container:     container,
-		maxMsgHist:    1000,
-		messages:      make([]MessageEvent, 0),
-		webhookURL:    os.Getenv("WEBHOOK_URL"),
-		webhookSecret: os.Getenv("WEBHOOK_SECRET"),
-		agentCode:     os.Getenv("AGENT_CODE"),
-		httpClient:    &http.Client{Timeout: 15 * time.Second},
-	}, nil
-}
-
-// dispatchWebhook envía un evento al webhook configurado de forma asíncrona.
-func (app *App) dispatchWebhook(event string, data interface{}) {
-	if app.webhookURL == "" {
-		return
-	}
-	go func() {
-		payload, err := json.Marshal(map[string]interface{}{
-			"event": event,
-			"data":  data,
-		})
-		if err != nil {
-			fmt.Printf("[WEBHOOK] Error serializando payload: %v\n", err)
-			return
-		}
-
-		req, err := http.NewRequest("POST", app.webhookURL, strings.NewReader(string(payload)))
-		if err != nil {
-			fmt.Printf("[WEBHOOK] Error creando request: %v\n", err)
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-		if app.webhookSecret != "" {
-			req.Header.Set("X-Webhook-Secret", app.webhookSecret)
-		}
-
-		resp, err := app.httpClient.Do(req)
-		if err != nil {
-			fmt.Printf("[WEBHOOK] Error enviando: %v\n", err)
-			return
-		}
-		defer resp.Body.Close()
-		fmt.Printf("[WEBHOOK] %s → %s: %d\n", event, app.webhookURL, resp.StatusCode)
-	}()
-}
-
-func (app *App) eventHandler(evt interface{}) {
-	switch v := evt.(type) {
-	case *events.Message:
-		if v.Message == nil {
-			break
-		}
-		if v.Message.GetProtocolMessage() != nil || v.Message.GetSenderKeyDistributionMessage() != nil {
-			break
-		}
-
-		msg := app.messageFromEvent(v.Info, v.Message)
-		fmt.Printf("[MSG] from=%s to=%s chat=%s pn=%s isFromMe=%v type=%s\n", msg.From, msg.To, msg.ChatJID, msg.SenderPN, msg.IsFromMe, msg.Type)
-		app.appendMessage(msg)
-		app.dispatchWebhook("messages.upsert", msg)
-
-	case *events.Receipt:
-		app.handleReceipt(v)
-
-	case *events.Connected:
-		app.mu.Lock()
-		app.connected = true
-		app.mu.Unlock()
-		fmt.Println("✓ WhatsApp connected")
-		app.dispatchWebhook("session.status", map[string]string{"status": "connected"})
-
-	case *events.Disconnected:
-		app.mu.Lock()
-		app.connected = false
-		app.mu.Unlock()
-		fmt.Println("✗ WhatsApp disconnected")
-		app.dispatchWebhook("session.status", map[string]string{"status": "disconnected"})
-
-	case *events.LoggedOut:
-		app.mu.Lock()
-		app.connected = false
-		app.client = nil
-		app.mu.Unlock()
-		fmt.Println("✗ WhatsApp logged out")
-		app.dispatchWebhook("session.status", map[string]string{"status": "logged_out"})
-
-	case *events.HistorySync:
-		if v.Data == nil || app.client == nil {
-			break
-		}
-		count := 0
-		seen := make(map[string]bool)
-		for _, conv := range v.Data.GetConversations() {
-			chatJID, err := types.ParseJID(conv.GetID())
-			if err != nil {
-				continue
-			}
-			for _, histMsg := range conv.GetMessages() {
-				evt, err := app.client.ParseWebMessage(chatJID, histMsg.GetMessage())
-				if err != nil || evt == nil || evt.Message == nil {
-					continue
-				}
-				if evt.Message.GetProtocolMessage() != nil || evt.Message.GetSenderKeyDistributionMessage() != nil {
-					continue
-				}
-				msg := app.messageFromEvent(evt.Info, evt.Message)
-				if msg.ID == "" || seen[msg.ID] {
-					continue
-				}
-				seen[msg.ID] = true
-				app.appendMessage(msg)
-				count++
-			}
-		}
-		fmt.Printf("[HISTORY_SYNC] Loaded %d messages from history\n", count)
-	}
-}
-
 // receiptTypeToStatus mapea recibos de WhatsApp al read_status del CRM (0-5).
 func receiptTypeToStatus(receiptType types.ReceiptType) int {
 	switch receiptType {
@@ -219,921 +52,6 @@ func receiptTypeToStatus(receiptType types.ReceiptType) int {
 	}
 }
 
-func (app *App) handleReceipt(receipt *events.Receipt) {
-	status := receiptTypeToStatus(receipt.Type)
-	if status < 0 {
-		return
-	}
-
-	chatJID := receipt.Chat.String()
-	for _, msgID := range receipt.MessageIDs {
-		if msgID == "" {
-			continue
-		}
-		fmt.Printf("[RECEIPT] id=%s chat=%s type=%s status=%d\n", msgID, chatJID, receipt.Type, status)
-		app.dispatchWebhook("messages.status", map[string]interface{}{
-			"id":           msgID,
-			"message_id":   msgID,
-			"status":       status,
-			"chat_jid":     chatJID,
-			"timestamp":    receipt.Timestamp.Unix(),
-			"receipt_type": string(receipt.Type),
-		})
-	}
-}
-
-func (app *App) handleStatus(w http.ResponseWriter, r *http.Request) {
-	app.mu.RLock()
-	qr := app.qrCode
-	client := app.client
-	connected := app.connected
-	app.mu.RUnlock()
-
-	status := "disconnected"
-	phone := ""
-	hasSession := false
-
-	if client != nil {
-		if client.Store.ID != nil {
-			hasSession = true
-		}
-		if connected {
-			status = "connected"
-			if client.Store.ID != nil {
-				phone = client.Store.ID.User
-			}
-		} else if qr != "" {
-			status = "need_scan"
-		} else if hasSession {
-			status = "connecting"
-		} else {
-			status = "logged_out"
-		}
-	} else {
-		deviceStore, err := app.container.GetFirstDevice(context.Background())
-		if err == nil && deviceStore.ID != nil {
-			hasSession = true
-			status = "disconnected"
-		} else {
-			status = "logged_out"
-		}
-	}
-
-	writeJSON(w, http.StatusOK, APIResponse{
-		Success: true,
-		Data: map[string]interface{}{
-			"status":      status,
-			"phone":       phone,
-			"has_session": hasSession,
-			"agent_code":  app.agentCode,
-		},
-	})
-}
-
-func (app *App) handleConnect(w http.ResponseWriter, r *http.Request) {
-	app.mu.Lock()
-	defer app.mu.Unlock()
-
-	if app.connected && app.client != nil {
-		writeJSON(w, http.StatusOK, APIResponse{
-			Success: true,
-			Message: "Already connected",
-		})
-		return
-	}
-
-	deviceStore, err := app.container.GetFirstDevice(context.Background())
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, APIResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to get device: %v", err),
-		})
-		return
-	}
-
-	clientLog := waLog.Stdout("Client", "WARN", true)
-	client := whatsmeow.NewClient(deviceStore, clientLog)
-	client.AddEventHandler(app.eventHandler)
-	app.client = client
-
-	if client.Store.ID == nil {
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, APIResponse{
-				Success: false,
-				Message: fmt.Sprintf("Failed to connect: %v", err),
-			})
-			return
-		}
-
-		app.qrChan = qrChan
-
-		go func() {
-			for evt := range qrChan {
-				if evt.Event == "code" {
-					app.mu.Lock()
-					app.qrCode = evt.Code
-					app.mu.Unlock()
-					fmt.Printf("QR code updated: %s\n", evt.Code[:20]+"...")
-				} else {
-					app.mu.Lock()
-					app.qrCode = ""
-					app.mu.Unlock()
-					fmt.Printf("QR channel event: %s\n", evt.Event)
-				}
-			}
-		}()
-
-		writeJSON(w, http.StatusOK, APIResponse{
-			Success: true,
-			Message: "QR code generated. Use GET /api/session/qr to retrieve it.",
-		})
-	} else {
-		err = client.Connect()
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, APIResponse{
-				Success: false,
-				Message: fmt.Sprintf("Failed to connect: %v", err),
-			})
-			return
-		}
-
-		writeJSON(w, http.StatusOK, APIResponse{
-			Success: true,
-			Message: "Reconnecting with existing session",
-		})
-	}
-}
-
-func (app *App) handleGetQR(w http.ResponseWriter, r *http.Request) {
-	app.mu.RLock()
-	qr := app.qrCode
-	app.mu.RUnlock()
-
-	if qr == "" {
-		writeJSON(w, http.StatusOK, APIResponse{
-			Success: false,
-			Message: "No QR code available. Either already connected or not initialized.",
-		})
-		return
-	}
-
-	format := r.URL.Query().Get("format")
-
-	if format == "image" {
-		png, err := qrcode.Encode(qr, qrcode.Medium, 512)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, APIResponse{
-				Success: false,
-				Message: "Failed to generate QR image",
-			})
-			return
-		}
-		w.Header().Set("Content-Type", "image/png")
-		w.Write(png)
-		return
-	}
-
-	png, _ := qrcode.Encode(qr, qrcode.Medium, 512)
-	b64 := base64.StdEncoding.EncodeToString(png)
-
-	writeJSON(w, http.StatusOK, APIResponse{
-		Success: true,
-		Data: map[string]interface{}{
-			"qr_code":    qr,
-			"qr_image":   "data:image/png;base64," + b64,
-			"expires_in": "60s",
-		},
-	})
-}
-
-func (app *App) handleDisconnect(w http.ResponseWriter, r *http.Request) {
-	app.mu.Lock()
-	defer app.mu.Unlock()
-
-	if app.client == nil {
-		writeJSON(w, http.StatusOK, APIResponse{
-			Success: true,
-			Message: "Not connected",
-		})
-		return
-	}
-
-	app.client.Disconnect()
-	app.connected = false
-
-	writeJSON(w, http.StatusOK, APIResponse{
-		Success: true,
-		Message: "Disconnected successfully",
-	})
-}
-
-func (app *App) handleLogout(w http.ResponseWriter, r *http.Request) {
-	app.mu.Lock()
-	defer app.mu.Unlock()
-
-	if app.client == nil {
-		writeJSON(w, http.StatusOK, APIResponse{
-			Success: false,
-			Message: "Not connected",
-		})
-		return
-	}
-
-	err := app.client.Logout(context.Background())
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, APIResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to logout: %v", err),
-		})
-		return
-	}
-
-	app.client = nil
-	app.connected = false
-
-	writeJSON(w, http.StatusOK, APIResponse{
-		Success: true,
-		Message: "Logged out successfully. Session deleted.",
-	})
-}
-
-func (app *App) handleSendMessage(w http.ResponseWriter, r *http.Request) {
-	app.mu.RLock()
-	if !app.connected || app.client == nil {
-		app.mu.RUnlock()
-		writeJSON(w, http.StatusBadRequest, APIResponse{
-			Success: false,
-			Message: "WhatsApp not connected",
-		})
-		return
-	}
-	app.mu.RUnlock()
-
-	var req SendMessageRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, APIResponse{
-			Success: false,
-			Message: "Invalid request body",
-		})
-		return
-	}
-
-	if req.Phone == "" || req.Message == "" {
-		writeJSON(w, http.StatusBadRequest, APIResponse{
-			Success: false,
-			Message: "phone and message are required",
-		})
-		return
-	}
-
-	jid := parseJID(req.Phone)
-	msg := &waE2E.Message{
-		Conversation: proto.String(req.Message),
-	}
-
-	resp, err := app.client.SendMessage(context.Background(), jid, msg)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, APIResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to send message: %v", err),
-		})
-		return
-	}
-
-	app.storeSentMessage(resp.ID, jid.String(), req.Message, "text", resp.Timestamp.Unix())
-
-	writeJSON(w, http.StatusOK, APIResponse{
-		Success: true,
-		Message: "Message sent",
-		Data: map[string]interface{}{
-			"message_id": resp.ID,
-			"timestamp":  resp.Timestamp.Unix(),
-		},
-	})
-}
-
-func (app *App) handleSendImage(w http.ResponseWriter, r *http.Request) {
-	app.mu.RLock()
-	if !app.connected || app.client == nil {
-		app.mu.RUnlock()
-		writeJSON(w, http.StatusBadRequest, APIResponse{
-			Success: false,
-			Message: "WhatsApp not connected",
-		})
-		return
-	}
-	app.mu.RUnlock()
-
-	var req SendImageRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, APIResponse{
-			Success: false,
-			Message: "Invalid request body",
-		})
-		return
-	}
-
-	if req.Phone == "" || req.Image == "" {
-		writeJSON(w, http.StatusBadRequest, APIResponse{
-			Success: false,
-			Message: "phone and image (base64) are required",
-		})
-		return
-	}
-
-	imageData, err := base64.StdEncoding.DecodeString(req.Image)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, APIResponse{
-			Success: false,
-			Message: "Invalid base64 image",
-		})
-		return
-	}
-
-	uploaded, err := app.client.Upload(context.Background(), imageData, whatsmeow.MediaImage)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, APIResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to upload image: %v", err),
-		})
-		return
-	}
-
-	jid := parseJID(req.Phone)
-	msg := &waE2E.Message{
-		ImageMessage: &waE2E.ImageMessage{
-			Caption:       proto.String(req.Caption),
-			URL:           proto.String(uploaded.URL),
-			DirectPath:    proto.String(uploaded.DirectPath),
-			MediaKey:      uploaded.MediaKey,
-			Mimetype:      proto.String("image/jpeg"),
-			FileEncSHA256: uploaded.FileEncSHA256,
-			FileSHA256:    uploaded.FileSHA256,
-			FileLength:    proto.Uint64(uint64(len(imageData))),
-		},
-	}
-
-	resp, err := app.client.SendMessage(context.Background(), jid, msg)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, APIResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to send image: %v", err),
-		})
-		return
-	}
-
-	app.storeSentMessage(resp.ID, jid.String(), req.Caption, "image", resp.Timestamp.Unix())
-
-	writeJSON(w, http.StatusOK, APIResponse{
-		Success: true,
-		Message: "Image sent",
-		Data: map[string]interface{}{
-			"message_id": resp.ID,
-			"timestamp":  resp.Timestamp.Unix(),
-		},
-	})
-}
-
-func (app *App) handleGetContacts(w http.ResponseWriter, r *http.Request) {
-	app.mu.RLock()
-	if !app.connected || app.client == nil {
-		app.mu.RUnlock()
-		writeJSON(w, http.StatusBadRequest, APIResponse{
-			Success: false,
-			Message: "WhatsApp not connected",
-		})
-		return
-	}
-	app.mu.RUnlock()
-
-	contacts, err := app.client.Store.Contacts.GetAllContacts(context.Background())
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, APIResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to get contacts: %v", err),
-		})
-		return
-	}
-
-	type ContactInfo struct {
-		JID      string `json:"jid"`
-		Name     string `json:"name"`
-		FullName string `json:"full_name"`
-		Phone    string `json:"phone"`
-		LID      string `json:"lid,omitempty"`
-	}
-
-	contactList := make([]ContactInfo, 0, len(contacts))
-	seenPhones := make(map[string]bool)
-
-	for jid, info := range contacts {
-		phone := jid.User
-		lid := ""
-		displayJID := jid.String()
-
-		if jid.Server == types.HiddenUserServer {
-			lid = jid.User
-			if app.client != nil && app.client.Store != nil {
-				if pn, err := app.client.Store.LIDs.GetPNForLID(context.Background(), jid); err == nil && !pn.IsEmpty() {
-					phone = pn.User
-					displayJID = pn.String()
-				}
-			}
-		} else if jid.Server == types.DefaultUserServer && app.client != nil && app.client.Store != nil {
-			if mappedLID, err := app.client.Store.LIDs.GetLIDForPN(context.Background(), jid); err == nil && !mappedLID.IsEmpty() {
-				lid = mappedLID.User
-			}
-		}
-
-		if jid.Server == types.HiddenUserServer && seenPhones[phone] {
-			continue
-		}
-		if phone != "" {
-			seenPhones[phone] = true
-		}
-
-		contactList = append(contactList, ContactInfo{
-			JID:      displayJID,
-			Name:     info.PushName,
-			FullName: info.FullName,
-			Phone:    phone,
-			LID:      lid,
-		})
-	}
-
-	writeJSON(w, http.StatusOK, APIResponse{
-		Success: true,
-		Data: map[string]interface{}{
-			"contacts": contactList,
-			"total":    len(contactList),
-		},
-	})
-}
-
-func (app *App) handleGetGroups(w http.ResponseWriter, r *http.Request) {
-	app.mu.RLock()
-	if !app.connected || app.client == nil {
-		app.mu.RUnlock()
-		writeJSON(w, http.StatusBadRequest, APIResponse{
-			Success: false,
-			Message: "WhatsApp not connected",
-		})
-		return
-	}
-	app.mu.RUnlock()
-
-	groups, err := app.client.GetJoinedGroups(context.Background())
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, APIResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to get groups: %v", err),
-		})
-		return
-	}
-
-	type GroupInfo struct {
-		JID          string `json:"jid"`
-		Name         string `json:"name"`
-		Topic        string `json:"topic"`
-		Participants int    `json:"participants"`
-		CreatedAt    int64  `json:"created_at"`
-	}
-
-	groupList := make([]GroupInfo, 0, len(groups))
-	for _, g := range groups {
-		groupList = append(groupList, GroupInfo{
-			JID:          g.JID.String(),
-			Name:         g.Name,
-			Topic:        g.Topic,
-			Participants: len(g.Participants),
-			CreatedAt:    g.GroupCreated.Unix(),
-		})
-	}
-
-	writeJSON(w, http.StatusOK, APIResponse{
-		Success: true,
-		Data: map[string]interface{}{
-			"groups": groupList,
-			"total":  len(groupList),
-		},
-	})
-}
-
-func (app *App) handleGetMessages(w http.ResponseWriter, r *http.Request) {
-	app.msgMu.RLock()
-	defer app.msgMu.RUnlock()
-
-	chatFilter := r.URL.Query().Get("chat")
-	jidFilter := r.URL.Query().Get("jid")
-	if chatFilter != "" || jidFilter != "" {
-		matchKeys := app.buildChatMatchKeys(chatFilter, jidFilter)
-		filtered := make([]MessageEvent, 0)
-		for _, msg := range app.messages {
-			if app.messageMatchesChat(msg, matchKeys) {
-				filtered = append(filtered, msg)
-			}
-		}
-		writeJSON(w, http.StatusOK, APIResponse{
-			Success: true,
-			Data: map[string]interface{}{
-				"messages": filtered,
-				"total":    len(filtered),
-				"chat":     chatFilter,
-			},
-		})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, APIResponse{
-		Success: true,
-		Data: map[string]interface{}{
-			"messages": app.messages,
-			"total":    len(app.messages),
-		},
-	})
-}
-
-func (app *App) handleGetProfilePic(w http.ResponseWriter, r *http.Request) {
-	app.mu.RLock()
-	if !app.connected || app.client == nil {
-		app.mu.RUnlock()
-		writeJSON(w, http.StatusBadRequest, APIResponse{
-			Success: false,
-			Message: "WhatsApp not connected",
-		})
-		return
-	}
-	app.mu.RUnlock()
-
-	phone := r.URL.Query().Get("phone")
-	if phone == "" {
-		writeJSON(w, http.StatusBadRequest, APIResponse{
-			Success: false,
-			Message: "phone parameter is required",
-		})
-		return
-	}
-
-	jid := parseJID(phone)
-	pic, err := app.client.GetProfilePictureInfo(context.Background(), jid, &whatsmeow.GetProfilePictureParams{})
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, APIResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to get profile picture: %v", err),
-		})
-		return
-	}
-
-	if pic == nil {
-		writeJSON(w, http.StatusOK, APIResponse{
-			Success: true,
-			Data: map[string]interface{}{
-				"url": "",
-			},
-		})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, APIResponse{
-		Success: true,
-		Data: map[string]interface{}{
-			"url": pic.URL,
-			"id":  pic.ID,
-		},
-	})
-}
-
-// handleWebhookConfig permite GET (ver config actual) y POST (actualizar config)
-func (app *App) handleWebhookConfig(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		writeJSON(w, http.StatusOK, APIResponse{
-			Success: true,
-			Data: map[string]interface{}{
-				"webhook_url":    app.webhookURL,
-				"webhook_secret": func() string {
-					if app.webhookSecret != "" { return "***" }
-					return ""
-				}(),
-				"agent_code": app.agentCode,
-			},
-		})
-
-	case http.MethodPost:
-		var req struct {
-			WebhookURL    string `json:"webhook_url"`
-			WebhookSecret string `json:"webhook_secret"`
-			AgentCode     string `json:"agent_code"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "Invalid JSON"})
-			return
-		}
-		if req.WebhookURL != "" {
-			app.webhookURL = req.WebhookURL
-		}
-		if req.WebhookSecret != "" {
-			app.webhookSecret = req.WebhookSecret
-		}
-		if req.AgentCode != "" {
-			app.agentCode = req.AgentCode
-		}
-		writeJSON(w, http.StatusOK, APIResponse{
-			Success: true,
-			Message: "Webhook config updated",
-			Data: map[string]interface{}{
-				"webhook_url": app.webhookURL,
-				"agent_code":  app.agentCode,
-			},
-		})
-
-	default:
-		writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Success: false, Message: "Method not allowed"})
-	}
-}
-
-func (app *App) handleCheckNumber(w http.ResponseWriter, r *http.Request) {
-	app.mu.RLock()
-	if !app.connected || app.client == nil {
-		app.mu.RUnlock()
-		writeJSON(w, http.StatusBadRequest, APIResponse{
-			Success: false,
-			Message: "WhatsApp not connected",
-		})
-		return
-	}
-	app.mu.RUnlock()
-
-	phone := r.URL.Query().Get("phone")
-	if phone == "" {
-		writeJSON(w, http.StatusBadRequest, APIResponse{
-			Success: false,
-			Message: "phone parameter is required",
-		})
-		return
-	}
-
-	phones := []string{phone}
-	resp, err := app.client.IsOnWhatsApp(context.Background(), phones)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, APIResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to check number: %v", err),
-		})
-		return
-	}
-
-	if len(resp) == 0 {
-		writeJSON(w, http.StatusOK, APIResponse{
-			Success: true,
-			Data: map[string]interface{}{
-				"registered": false,
-			},
-		})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, APIResponse{
-		Success: true,
-		Data: map[string]interface{}{
-			"registered": resp[0].IsIn,
-			"jid":        resp[0].JID.String(),
-		},
-	})
-}
-
-func (app *App) handleSendGroupMessage(w http.ResponseWriter, r *http.Request) {
-	app.mu.RLock()
-	if !app.connected || app.client == nil {
-		app.mu.RUnlock()
-		writeJSON(w, http.StatusBadRequest, APIResponse{
-			Success: false,
-			Message: "WhatsApp not connected",
-		})
-		return
-	}
-	app.mu.RUnlock()
-
-	var req struct {
-		GroupJID string `json:"group_jid"`
-		Message  string `json:"message"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, APIResponse{
-			Success: false,
-			Message: "Invalid request body",
-		})
-		return
-	}
-
-	if req.GroupJID == "" || req.Message == "" {
-		writeJSON(w, http.StatusBadRequest, APIResponse{
-			Success: false,
-			Message: "group_jid and message are required",
-		})
-		return
-	}
-
-	jid, err := types.ParseJID(req.GroupJID)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, APIResponse{
-			Success: false,
-			Message: fmt.Sprintf("Invalid group JID: %v", err),
-		})
-		return
-	}
-
-	msg := &waE2E.Message{
-		Conversation: proto.String(req.Message),
-	}
-
-	resp, err := app.client.SendMessage(context.Background(), jid, msg)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, APIResponse{
-			Success: false,
-			Message: fmt.Sprintf("Failed to send message: %v", err),
-		})
-		return
-	}
-
-	app.storeSentMessage(resp.ID, jid.String(), req.Message, "text", resp.Timestamp.Unix())
-
-	writeJSON(w, http.StatusOK, APIResponse{
-		Success: true,
-		Message: "Group message sent",
-		Data: map[string]interface{}{
-			"message_id": resp.ID,
-			"timestamp":  resp.Timestamp.Unix(),
-		},
-	})
-}
-
-func (app *App) messageFromEvent(info types.MessageInfo, message *waE2E.Message) MessageEvent {
-	senderPN := ""
-	if info.SenderAlt.User != "" {
-		senderPN = info.SenderAlt.User
-	}
-
-	chatJID := info.Chat.String()
-	if info.IsFromMe && info.RecipientAlt.User != "" {
-		chatJID = info.RecipientAlt.String()
-		senderPN = info.RecipientAlt.User
-	} else if !info.IsGroup && !info.IsFromMe && info.SenderAlt.User != "" {
-		chatJID = info.SenderAlt.String()
-	} else if info.Chat.Server == types.HiddenUserServer && info.RecipientAlt.User != "" {
-		chatJID = info.RecipientAlt.String()
-		if senderPN == "" {
-			senderPN = info.RecipientAlt.User
-		}
-	}
-
-	msg := MessageEvent{
-		ID:        info.ID,
-		From:      info.Sender.String(),
-		To:        info.Chat.String(),
-		ChatJID:   chatJID,
-		SenderPN:  senderPN,
-		Timestamp: info.Timestamp.Unix(),
-		IsGroup:   info.IsGroup,
-		IsFromMe:  info.IsFromMe,
-		PushName:  info.PushName,
-	}
-	app.extractMessageContent(message, &msg)
-	if msg.Type == "" {
-		msg.Type = "unknown"
-	}
-	return msg
-}
-
-func (app *App) appendMessage(msg MessageEvent) {
-	app.msgMu.Lock()
-	defer app.msgMu.Unlock()
-	for _, existing := range app.messages {
-		if existing.ID == msg.ID {
-			return
-		}
-	}
-	app.messages = append(app.messages, msg)
-	if len(app.messages) > app.maxMsgHist {
-		app.messages = app.messages[len(app.messages)-app.maxMsgHist:]
-	}
-}
-
-func (app *App) addMatchKey(keys map[string]bool, value string) {
-	if value == "" {
-		return
-	}
-	keys[value] = true
-	if idx := strings.Index(value, "@"); idx > 0 {
-		keys[value[:idx]] = true
-	}
-}
-
-func (app *App) buildChatMatchKeys(chatFilter, jidFilter string) map[string]bool {
-	keys := make(map[string]bool)
-	app.addMatchKey(keys, chatFilter)
-	app.addMatchKey(keys, jidFilter)
-
-	normalized := strings.Split(chatFilter, "@")[0]
-	if normalized == "" {
-		normalized = strings.Split(jidFilter, "@")[0]
-	}
-	if normalized == "" || app.client == nil || app.client.Store == nil {
-		return keys
-	}
-
-	phoneJID := types.NewJID(normalized, types.DefaultUserServer)
-	if lid, err := app.client.Store.LIDs.GetLIDForPN(context.Background(), phoneJID); err == nil && !lid.IsEmpty() {
-		app.addMatchKey(keys, lid.String())
-		app.addMatchKey(keys, lid.User)
-	}
-
-	lidJID := types.NewJID(normalized, types.HiddenUserServer)
-	if pn, err := app.client.Store.LIDs.GetPNForLID(context.Background(), lidJID); err == nil && !pn.IsEmpty() {
-		app.addMatchKey(keys, pn.String())
-		app.addMatchKey(keys, pn.User)
-	}
-
-	return keys
-}
-
-func (app *App) messageMatchesChat(msg MessageEvent, keys map[string]bool) bool {
-	fields := []string{msg.From, msg.To, msg.ChatJID, msg.SenderPN}
-	for _, field := range fields {
-		if field == "" {
-			continue
-		}
-		if keys[field] {
-			return true
-		}
-		if idx := strings.Index(field, "@"); idx > 0 && keys[field[:idx]] {
-			return true
-		}
-	}
-	return false
-}
-
-func (app *App) extractMessageContent(msg *waE2E.Message, evt *MessageEvent) {
-	if msg == nil {
-		return
-	}
-	switch {
-	case msg.GetConversation() != "":
-		evt.Body = msg.GetConversation()
-		evt.Type = "text"
-	case msg.GetExtendedTextMessage() != nil:
-		evt.Body = msg.GetExtendedTextMessage().GetText()
-		evt.Type = "text"
-	case msg.GetImageMessage() != nil:
-		evt.Type = "image"
-		evt.Body = msg.GetImageMessage().GetCaption()
-	case msg.GetVideoMessage() != nil:
-		evt.Type = "video"
-		evt.Body = msg.GetVideoMessage().GetCaption()
-	case msg.GetDocumentMessage() != nil:
-		evt.Type = "document"
-		evt.Body = msg.GetDocumentMessage().GetFileName()
-	case msg.GetAudioMessage() != nil:
-		evt.Type = "audio"
-		if msg.GetAudioMessage().GetPTT() {
-			evt.Type = "ptt"
-		}
-	case msg.GetStickerMessage() != nil:
-		evt.Type = "sticker"
-	case msg.GetContactMessage() != nil:
-		evt.Type = "contact"
-		evt.Body = msg.GetContactMessage().GetDisplayName()
-	case msg.GetLocationMessage() != nil:
-		evt.Type = "location"
-		loc := msg.GetLocationMessage()
-		evt.Body = fmt.Sprintf("📍 %.6f, %.6f", loc.GetDegreesLatitude(), loc.GetDegreesLongitude())
-	}
-}
-
-func (app *App) storeSentMessage(id string, toJID string, body string, msgType string, timestamp int64) {
-	myJID := ""
-	if app.client != nil && app.client.Store.ID != nil {
-		myJID = app.client.Store.ID.String()
-	}
-	msg := MessageEvent{
-		ID:        id,
-		From:      myJID,
-		To:        toJID,
-		ChatJID:   toJID,
-		Body:      body,
-		Type:      msgType,
-		Timestamp: timestamp,
-		IsGroup:   strings.Contains(toJID, "@g.us"),
-		IsFromMe:  true,
-		PushName:  "Yo",
-	}
-	app.appendMessage(msg)
-}
-
-// --- Helpers ---
-
 func parseJID(phone string) types.JID {
 	phone = strings.TrimPrefix(phone, "+")
 	phone = strings.ReplaceAll(phone, " ", "")
@@ -1143,7 +61,6 @@ func parseJID(phone string) types.JID {
 		jid, _ := types.ParseJID(phone)
 		return jid
 	}
-
 	return types.NewJID(phone, types.DefaultUserServer)
 }
 
@@ -1157,25 +74,24 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
-
-		if r.Method == "OPTIONS" {
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-API-Key, Authorization")
+		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-
 		next.ServeHTTP(w, r)
 	})
 }
 
 func authMiddleware(next http.Handler) http.Handler {
-	apiKey := os.Getenv("API_KEY")
-	if apiKey == "" {
-		return next
-	}
-
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" || r.URL.Path == "/health" {
+		if r.URL.Path == "/health" || r.URL.Path == "/" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		apiKey := os.Getenv("API_KEY")
+		if apiKey == "" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -1184,7 +100,6 @@ func authMiddleware(next http.Handler) http.Handler {
 		if key == "" {
 			key = r.URL.Query().Get("api_key")
 		}
-
 		if key != apiKey {
 			writeJSON(w, http.StatusUnauthorized, APIResponse{
 				Success: false,
@@ -1192,7 +107,6 @@ func authMiddleware(next http.Handler) http.Handler {
 			})
 			return
 		}
-
 		next.ServeHTTP(w, r)
 	})
 }
@@ -1206,43 +120,40 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// Health check (public, no auth required)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, APIResponse{Success: true, Message: "ok"})
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, APIResponse{
 			Success: true,
-			Message: "WhatsApp API Service - Running",
+			Message: "WhatsApp API Service - Multi-session",
 			Data: map[string]interface{}{
-				"version":   "1.0.0",
-				"endpoints": []string{"/api/status", "/api/session/connect", "/api/session/qr", "/api/session/disconnect", "/api/session/logout", "/api/messages/send", "/api/messages/send-image", "/api/messages/send-group", "/api/messages/history", "/api/contacts", "/api/groups", "/api/check-number", "/api/profile-pic"},
+				"version": "2.0.0",
+				"multi_session": true,
+				"endpoints": []string{
+					"/api/status",
+					"/api/status?agent_code=AGENT",
+					"/api/session/connect",
+					"/api/session/qr?agent_code=AGENT",
+					"/api/webhook/config",
+				},
 			},
 		})
 	})
 
-	// Session endpoints
 	mux.HandleFunc("/api/status", app.handleStatus)
 	mux.HandleFunc("/api/session/connect", app.handleConnect)
 	mux.HandleFunc("/api/session/qr", app.handleGetQR)
 	mux.HandleFunc("/api/session/disconnect", app.handleDisconnect)
 	mux.HandleFunc("/api/session/logout", app.handleLogout)
-
-	// Message endpoints
 	mux.HandleFunc("/api/messages/send", app.handleSendMessage)
 	mux.HandleFunc("/api/messages/send-image", app.handleSendImage)
 	mux.HandleFunc("/api/messages/send-group", app.handleSendGroupMessage)
 	mux.HandleFunc("/api/messages/history", app.handleGetMessages)
-
-	// Contact & Group endpoints
 	mux.HandleFunc("/api/contacts", app.handleGetContacts)
 	mux.HandleFunc("/api/groups", app.handleGetGroups)
-
-	// Utility endpoints
 	mux.HandleFunc("/api/check-number", app.handleCheckNumber)
 	mux.HandleFunc("/api/profile-pic", app.handleGetProfilePic)
-
-	// Webhook configuration endpoint
 	mux.HandleFunc("/api/webhook/config", app.handleWebhookConfig)
 
 	handler := corsMiddleware(authMiddleware(mux))
@@ -1252,23 +163,9 @@ func main() {
 		port = "8080"
 	}
 
-	// Auto-connect on startup if session exists
 	go func() {
 		time.Sleep(2 * time.Second)
-		deviceStore, err := app.container.GetFirstDevice(context.Background())
-		if err == nil && deviceStore.ID != nil {
-			fmt.Println("Found existing session, auto-connecting...")
-			clientLog := waLog.Stdout("Client", "WARN", true)
-			client := whatsmeow.NewClient(deviceStore, clientLog)
-			client.AddEventHandler(app.eventHandler)
-			app.mu.Lock()
-			app.client = client
-			app.mu.Unlock()
-			err = client.Connect()
-			if err != nil {
-				fmt.Printf("Auto-connect failed: %v\n", err)
-			}
-		}
+		app.manager.AutoConnectAll()
 	}()
 
 	server := &http.Server{
@@ -1278,8 +175,7 @@ func main() {
 		WriteTimeout: 30 * time.Second,
 	}
 
-	fmt.Printf("🚀 WhatsApp API Server starting on port %s\n", port)
-	fmt.Printf("📡 Endpoints available at http://localhost:%s/\n", port)
+	fmt.Printf("🚀 WhatsApp API Server (multi-session) starting on port %s\n", port)
 
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -1293,12 +189,6 @@ func main() {
 	<-c
 
 	fmt.Println("\nShutting down...")
-	app.mu.RLock()
-	if app.client != nil {
-		app.client.Disconnect()
-	}
-	app.mu.RUnlock()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	server.Shutdown(ctx)

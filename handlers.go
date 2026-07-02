@@ -1,0 +1,615 @@
+package main
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"strings"
+
+	"github.com/skip2/go-qrcode"
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types"
+	"google.golang.org/protobuf/proto"
+)
+
+type App struct {
+	manager *SessionManager
+}
+
+func NewApp() (*App, error) {
+	dataDir := strings.TrimSpace(os.Getenv("DATA_DIR"))
+	if dataDir == "" {
+		dataDir = "/app/data"
+	}
+	manager, err := NewSessionManager(dataDir, strings.TrimSpace(os.Getenv("WEBHOOK_SECRET")))
+	if err != nil {
+		return nil, err
+	}
+	return &App{manager: manager}, nil
+}
+
+func agentCodeFromQuery(r *http.Request) string {
+	return strings.TrimSpace(r.URL.Query().Get("agent_code"))
+}
+
+func requireAgentCode(w http.ResponseWriter, r *http.Request) (string, bool) {
+	code := agentCodeFromQuery(r)
+	if code == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Message: "agent_code is required (query param or JSON body)",
+		})
+		return "", false
+	}
+	return code, true
+}
+
+func (app *App) sessionFromRequest(w http.ResponseWriter, r *http.Request, bodyAgentCode string) (*AgentSession, bool) {
+	code := agentCodeFromQuery(r)
+	if code == "" {
+		code = strings.TrimSpace(bodyAgentCode)
+	}
+	if code == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "agent_code is required"})
+		return nil, false
+	}
+	s, ok := app.manager.GetSession(code)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, APIResponse{
+			Success: false,
+			Message: fmt.Sprintf("Session not registered for agent %s. Configure webhook first.", code),
+		})
+		return nil, false
+	}
+	return s, true
+}
+
+func (app *App) handleStatus(w http.ResponseWriter, r *http.Request) {
+	code := agentCodeFromQuery(r)
+	if code == "" {
+		sessions := app.manager.ListStatus()
+		writeJSON(w, http.StatusOK, APIResponse{
+			Success: true,
+			Data: map[string]interface{}{
+				"sessions": sessions,
+				"total":    len(sessions),
+			},
+		})
+		return
+	}
+
+	s, ok := app.manager.GetSession(code)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Message: "Session not found"})
+		return
+	}
+	info := s.StatusInfo()
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data: map[string]interface{}{
+			"status":      info.Status,
+			"phone":       info.Phone,
+			"has_session": info.HasSession,
+			"agent_code":  info.AgentCode,
+			"webhook_url": info.WebhookURL,
+		},
+	})
+}
+
+func (app *App) handleConnect(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AgentCode     string `json:"agent_code"`
+		WebhookURL    string `json:"webhook_url"`
+		WebhookSecret string `json:"webhook_secret"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.AgentCode == "" {
+		req.AgentCode = agentCodeFromQuery(r)
+	}
+	if req.AgentCode == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "agent_code is required"})
+		return
+	}
+
+	if _, err := app.manager.EnsureSession(req.AgentCode, req.WebhookURL, req.WebhookSecret); err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
+		return
+	}
+
+	s, ok := app.manager.GetSession(req.AgentCode)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: "Failed to init session"})
+		return
+	}
+
+	needsQR, err := s.Connect()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: fmt.Sprintf("Failed to connect: %v", err)})
+		return
+	}
+
+	msg := "Reconnecting with existing session"
+	if needsQR {
+		msg = "QR code generated. Use GET /api/session/qr?agent_code=" + req.AgentCode
+	}
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Message: msg, Data: map[string]interface{}{"needs_qr": needsQR}})
+}
+
+func (app *App) handleGetQR(w http.ResponseWriter, r *http.Request) {
+	code, ok := requireAgentCode(w, r)
+	if !ok {
+		return
+	}
+	s, ok := app.manager.GetSession(code)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Message: "Session not found"})
+		return
+	}
+
+	qr := s.GetQR()
+	if qr == "" {
+		writeJSON(w, http.StatusOK, APIResponse{Success: false, Message: "No QR code available"})
+		return
+	}
+
+	if r.URL.Query().Get("format") == "image" {
+		png, err := qrcode.Encode(qr, qrcode.Medium, 512)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: "Failed to generate QR image"})
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.Write(png)
+		return
+	}
+
+	png, _ := qrcode.Encode(qr, qrcode.Medium, 512)
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data: map[string]interface{}{
+			"qr_code":    qr,
+			"qr_image":   "data:image/png;base64," + base64.StdEncoding.EncodeToString(png),
+			"agent_code": code,
+			"expires_in": "60s",
+		},
+	})
+}
+
+func (app *App) handleDisconnect(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AgentCode string `json:"agent_code"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.AgentCode == "" {
+		req.AgentCode = agentCodeFromQuery(r)
+	}
+	s, ok := app.sessionFromRequest(w, r, req.AgentCode)
+	if !ok {
+		return
+	}
+	s.Disconnect()
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Message: "Disconnected successfully"})
+}
+
+func (app *App) handleLogout(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AgentCode string `json:"agent_code"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.AgentCode == "" {
+		req.AgentCode = agentCodeFromQuery(r)
+	}
+	s, ok := app.sessionFromRequest(w, r, req.AgentCode)
+	if !ok {
+		return
+	}
+	if err := s.Logout(context.Background()); err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Message: "Logged out successfully. Session deleted."})
+}
+
+func (app *App) handleSendMessage(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AgentCode string `json:"agent_code"`
+		Phone     string `json:"phone"`
+		Message   string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "Invalid request body"})
+		return
+	}
+	s, ok := app.sessionFromRequest(w, r, req.AgentCode)
+	if !ok {
+		return
+	}
+	client, connected := s.Client()
+	if !connected {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WhatsApp not connected for this agent"})
+		return
+	}
+	if req.Phone == "" || req.Message == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "phone and message are required"})
+		return
+	}
+
+	jid := parseJID(req.Phone)
+	msg := &waE2E.Message{Conversation: proto.String(req.Message)}
+	resp, err := client.SendMessage(context.Background(), jid, msg)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
+		return
+	}
+	s.storeSentMessage(resp.ID, jid.String(), req.Message, "text", resp.Timestamp.Unix())
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Message: "Message sent",
+		Data:    map[string]interface{}{"message_id": resp.ID, "timestamp": resp.Timestamp.Unix()},
+	})
+}
+
+func (app *App) handleSendImage(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AgentCode string `json:"agent_code"`
+		Phone     string `json:"phone"`
+		Image     string `json:"image"`
+		Caption   string `json:"caption"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "Invalid request body"})
+		return
+	}
+	s, ok := app.sessionFromRequest(w, r, req.AgentCode)
+	if !ok {
+		return
+	}
+	client, connected := s.Client()
+	if !connected {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WhatsApp not connected for this agent"})
+		return
+	}
+
+	imageData, err := base64.StdEncoding.DecodeString(req.Image)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "Invalid base64 image"})
+		return
+	}
+
+	uploaded, err := client.Upload(context.Background(), imageData, whatsmeow.MediaImage)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
+		return
+	}
+
+	jid := parseJID(req.Phone)
+	msg := &waE2E.Message{
+		ImageMessage: &waE2E.ImageMessage{
+			Caption:       proto.String(req.Caption),
+			URL:           proto.String(uploaded.URL),
+			DirectPath:    proto.String(uploaded.DirectPath),
+			MediaKey:      uploaded.MediaKey,
+			Mimetype:      proto.String("image/jpeg"),
+			FileEncSHA256: uploaded.FileEncSHA256,
+			FileSHA256:    uploaded.FileSHA256,
+			FileLength:    proto.Uint64(uint64(len(imageData))),
+		},
+	}
+	resp, err := client.SendMessage(context.Background(), jid, msg)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
+		return
+	}
+	s.storeSentMessage(resp.ID, jid.String(), req.Caption, "image", resp.Timestamp.Unix())
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Message: "Image sent",
+		Data:    map[string]interface{}{"message_id": resp.ID, "timestamp": resp.Timestamp.Unix()},
+	})
+}
+
+func (app *App) handleGetContacts(w http.ResponseWriter, r *http.Request) {
+	code, ok := requireAgentCode(w, r)
+	if !ok {
+		return
+	}
+	s, ok := app.manager.GetSession(code)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Message: "Session not found"})
+		return
+	}
+	client, connected := s.Client()
+	if !connected {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WhatsApp not connected"})
+		return
+	}
+
+	contacts, err := client.Store.Contacts.GetAllContacts(context.Background())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
+		return
+	}
+
+	type ContactInfo struct {
+		JID      string `json:"jid"`
+		Name     string `json:"name"`
+		FullName string `json:"full_name"`
+		Phone    string `json:"phone"`
+		LID      string `json:"lid,omitempty"`
+	}
+
+	contactList := make([]ContactInfo, 0, len(contacts))
+	seenPhones := make(map[string]bool)
+	for jid, info := range contacts {
+		phone := jid.User
+		lid := ""
+		displayJID := jid.String()
+		if jid.Server == types.HiddenUserServer {
+			lid = jid.User
+			if pn, err := client.Store.LIDs.GetPNForLID(context.Background(), jid); err == nil && !pn.IsEmpty() {
+				phone = pn.User
+				displayJID = pn.String()
+			}
+		}
+		if jid.Server == types.HiddenUserServer && seenPhones[phone] {
+			continue
+		}
+		if phone != "" {
+			seenPhones[phone] = true
+		}
+		contactList = append(contactList, ContactInfo{
+			JID: displayJID, Name: info.PushName, FullName: info.FullName, Phone: phone, LID: lid,
+		})
+	}
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"contacts": contactList, "total": len(contactList)}})
+}
+
+func (app *App) handleGetGroups(w http.ResponseWriter, r *http.Request) {
+	code, ok := requireAgentCode(w, r)
+	if !ok {
+		return
+	}
+	s, ok := app.manager.GetSession(code)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Message: "Session not found"})
+		return
+	}
+	client, connected := s.Client()
+	if !connected {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WhatsApp not connected"})
+		return
+	}
+	groups, err := client.GetJoinedGroups(context.Background())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
+		return
+	}
+	type GroupInfo struct {
+		JID          string `json:"jid"`
+		Name         string `json:"name"`
+		Topic        string `json:"topic"`
+		Participants int    `json:"participants"`
+		CreatedAt    int64  `json:"created_at"`
+	}
+	groupList := make([]GroupInfo, 0, len(groups))
+	for _, g := range groups {
+		groupList = append(groupList, GroupInfo{
+			JID: g.JID.String(), Name: g.Name, Topic: g.Topic,
+			Participants: len(g.Participants), CreatedAt: g.GroupCreated.Unix(),
+		})
+	}
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"groups": groupList, "total": len(groupList)}})
+}
+
+func (app *App) handleGetMessages(w http.ResponseWriter, r *http.Request) {
+	code, ok := requireAgentCode(w, r)
+	if !ok {
+		return
+	}
+	s, ok := app.manager.GetSession(code)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Message: "Session not found"})
+		return
+	}
+	msgs := s.Messages()
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"messages": msgs, "total": len(msgs)}})
+}
+
+func (app *App) handleGetProfilePic(w http.ResponseWriter, r *http.Request) {
+	code, ok := requireAgentCode(w, r)
+	if !ok {
+		return
+	}
+	s, ok := app.manager.GetSession(code)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Message: "Session not found"})
+		return
+	}
+	client, connected := s.Client()
+	if !connected {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WhatsApp not connected"})
+		return
+	}
+	phone := r.URL.Query().Get("phone")
+	if phone == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "phone parameter is required"})
+		return
+	}
+	jid := parseJID(phone)
+	pic, err := client.GetProfilePictureInfo(context.Background(), jid, &whatsmeow.GetProfilePictureParams{})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
+		return
+	}
+	if pic == nil {
+		writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"url": ""}})
+		return
+	}
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"url": pic.URL, "id": pic.ID}})
+}
+
+func (app *App) handleCheckNumber(w http.ResponseWriter, r *http.Request) {
+	code, ok := requireAgentCode(w, r)
+	if !ok {
+		return
+	}
+	s, ok := app.manager.GetSession(code)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Message: "Session not found"})
+		return
+	}
+	client, connected := s.Client()
+	if !connected {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WhatsApp not connected"})
+		return
+	}
+	phone := r.URL.Query().Get("phone")
+	if phone == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "phone parameter is required"})
+		return
+	}
+	resp, err := client.IsOnWhatsApp(context.Background(), []string{phone})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
+		return
+	}
+	if len(resp) == 0 {
+		writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"registered": false}})
+		return
+	}
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"registered": resp[0].IsIn, "jid": resp[0].JID.String()}})
+}
+
+func (app *App) handleSendGroupMessage(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AgentCode string `json:"agent_code"`
+		GroupJID  string `json:"group_jid"`
+		Message   string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "Invalid request body"})
+		return
+	}
+	s, ok := app.sessionFromRequest(w, r, req.AgentCode)
+	if !ok {
+		return
+	}
+	client, connected := s.Client()
+	if !connected {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WhatsApp not connected"})
+		return
+	}
+	jid, err := types.ParseJID(req.GroupJID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "Invalid group JID"})
+		return
+	}
+	msg := &waE2E.Message{Conversation: proto.String(req.Message)}
+	resp, err := client.SendMessage(context.Background(), jid, msg)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
+		return
+	}
+	s.storeSentMessage(resp.ID, jid.String(), req.Message, "text", resp.Timestamp.Unix())
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"message_id": resp.ID}})
+}
+
+func (app *App) handleWebhookConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		code := agentCodeFromQuery(r)
+		if code == "" {
+			registry := app.manager.ListRegistry()
+			sessions := app.manager.ListStatus()
+			writeJSON(w, http.StatusOK, APIResponse{
+				Success: true,
+				Data: map[string]interface{}{
+					"sessions": sessions,
+					"registry": registry,
+				},
+			})
+			return
+		}
+		s, ok := app.manager.GetSession(code)
+		if !ok {
+			entry := app.manager.ListRegistry()[code]
+			if entry == nil {
+				writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Message: "Agent not registered"})
+				return
+			}
+			writeJSON(w, http.StatusOK, APIResponse{
+				Success: true,
+				Data: map[string]interface{}{
+					"agent_code":  entry.AgentCode,
+					"webhook_url": entry.WebhookURL,
+					"webhook_secret": func() string {
+						if entry.WebhookSecret != "" {
+							return "***"
+						}
+						return ""
+					}(),
+				},
+			})
+			return
+		}
+		info := s.StatusInfo()
+		writeJSON(w, http.StatusOK, APIResponse{
+			Success: true,
+			Data: map[string]interface{}{
+				"agent_code":  info.AgentCode,
+				"webhook_url": info.WebhookURL,
+				"webhook_secret": func() string {
+					s.mu.RLock()
+					defer s.mu.RUnlock()
+					if s.WebhookSecret != "" {
+						return "***"
+					}
+					return ""
+				}(),
+				"status": info.Status,
+				"phone":  info.Phone,
+			},
+		})
+
+	case http.MethodPost:
+		var req struct {
+			AgentCode     string `json:"agent_code"`
+			WebhookURL    string `json:"webhook_url"`
+			WebhookSecret string `json:"webhook_secret"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "Invalid JSON"})
+			return
+		}
+		if req.AgentCode == "" {
+			writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "agent_code is required"})
+			return
+		}
+		if err := app.manager.UpdateWebhook(req.AgentCode, req.WebhookURL, req.WebhookSecret); err != nil {
+			writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
+			return
+		}
+		s, ok := app.manager.GetSession(req.AgentCode)
+		data := map[string]interface{}{
+			"agent_code":  req.AgentCode,
+			"webhook_url": req.WebhookURL,
+		}
+		if ok && s != nil {
+			info := s.StatusInfo()
+			data["agent_code"] = info.AgentCode
+			data["webhook_url"] = info.WebhookURL
+		}
+		writeJSON(w, http.StatusOK, APIResponse{
+			Success: true,
+			Message: "Webhook config updated",
+			Data:    data,
+		})
+
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Success: false, Message: "Method not allowed"})
+	}
+}
