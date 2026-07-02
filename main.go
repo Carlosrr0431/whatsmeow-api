@@ -146,48 +146,7 @@ func (app *App) eventHandler(evt interface{}) {
 		fmt.Println("✗ WhatsApp logged out")
 
 	case *events.HistorySync:
-		if v.Data == nil {
-			break
-		}
-		count := 0
-		for _, conv := range v.Data.GetConversations() {
-			chatJID, err := types.ParseJID(conv.GetId())
-			if err != nil {
-				continue
-			}
-			for _, histMsg := range conv.GetMessages() {
-				evt, err := app.client.ParseWebMessage(chatJID, histMsg.GetMessage())
-				if err != nil || evt == nil {
-					continue
-				}
-				if evt.Message == nil || evt.Message.GetProtocolMessage() != nil || evt.Message.GetSenderKeyDistributionMessage() != nil {
-					continue
-				}
-				msg := MessageEvent{
-					ID:        evt.Info.ID,
-					From:      evt.Info.Sender.String(),
-					To:        evt.Info.Chat.String(),
-					Timestamp: evt.Info.Timestamp.Unix(),
-					IsGroup:   evt.Info.IsGroup,
-					IsFromMe:  evt.Info.IsFromMe,
-					PushName:  evt.Info.PushName,
-				}
-				app.extractMessageContent(evt.Message, &msg)
-				if msg.Type == "" {
-					msg.Type = "unknown"
-				}
-				app.msgMu.Lock()
-				app.messages = append(app.messages, msg)
-				app.msgMu.Unlock()
-				count++
-			}
-		}
-		app.msgMu.Lock()
-		if len(app.messages) > app.maxMsgHist {
-			app.messages = app.messages[len(app.messages)-app.maxMsgHist:]
-		}
-		app.msgMu.Unlock()
-		fmt.Printf("[HISTORY_SYNC] Loaded %d messages from history\n", count)
+		fmt.Println("[HISTORY_SYNC] received (messages will be available from live events only)")
 	}
 }
 
@@ -623,29 +582,11 @@ func (app *App) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 	if chatFilter != "" {
 		normalizedFilter := strings.Split(chatFilter, "@")[0]
 
-		// Build a set of JID strings that represent this contact
-		matchJIDs := map[string]bool{
-			normalizedFilter:                       true,
-			normalizedFilter + "@s.whatsapp.net":   true,
-			normalizedFilter + "@lid":              true,
-		}
-
-		// Try to resolve LID<->phone mapping
-		if app.client != nil && app.client.Store != nil {
-			phoneJID := types.NewJID(normalizedFilter, types.DefaultUserServer)
-			lid, err := app.client.Store.LIDs.GetLIDForPN(context.Background(), phoneJID)
-			if err == nil && !lid.IsEmpty() {
-				matchJIDs[lid.String()] = true
-				matchJIDs[lid.User] = true
-			}
-		}
-
 		filtered := make([]MessageEvent, 0)
 		for _, msg := range app.messages {
 			fromUser := strings.Split(msg.From, "@")[0]
 			toUser := strings.Split(msg.To, "@")[0]
-			if matchJIDs[fromUser] || matchJIDs[toUser] ||
-				matchJIDs[msg.From] || matchJIDs[msg.To] ||
+			if fromUser == normalizedFilter || toUser == normalizedFilter ||
 				strings.Contains(msg.From, normalizedFilter) || strings.Contains(msg.To, normalizedFilter) {
 				filtered = append(filtered, msg)
 			}
