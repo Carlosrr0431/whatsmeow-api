@@ -27,6 +27,4 @@ ENV PORT=8080
 
 EXPOSE 8080
 
-VOLUME ["/app/data"]
-
 CMD ["./whatsmeow-api"]
