@@ -4,11 +4,12 @@ RUN apk add --no-cache gcc musl-dev sqlite-dev git ca-certificates
 
 WORKDIR /app
 
-COPY go.mod ./
-RUN go mod download 2>/dev/null || true
-
 COPY . .
-RUN go mod tidy
+RUN go get go.mau.fi/whatsmeow@latest && \
+    go get github.com/mattn/go-sqlite3@latest && \
+    go get github.com/skip2/go-qrcode@latest && \
+    go get google.golang.org/protobuf@latest && \
+    go mod tidy
 
 RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o whatsmeow-api .
 
