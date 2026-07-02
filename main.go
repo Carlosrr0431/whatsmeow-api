@@ -144,6 +144,9 @@ func (app *App) eventHandler(evt interface{}) {
 		app.appendMessage(msg)
 		app.dispatchWebhook("messages.upsert", msg)
 
+	case *events.Receipt:
+		app.handleReceipt(v)
+
 	case *events.Connected:
 		app.mu.Lock()
 		app.connected = true
@@ -195,6 +198,47 @@ func (app *App) eventHandler(evt interface{}) {
 			}
 		}
 		fmt.Printf("[HISTORY_SYNC] Loaded %d messages from history\n", count)
+	}
+}
+
+// receiptTypeToStatus mapea recibos de WhatsApp al read_status del CRM (0-5).
+func receiptTypeToStatus(receiptType types.ReceiptType) int {
+	switch receiptType {
+	case types.ReceiptTypeSender:
+		return 2
+	case types.ReceiptTypeDelivered:
+		return 3
+	case types.ReceiptTypeRead, types.ReceiptTypeReadSelf:
+		return 4
+	case types.ReceiptTypePlayed, types.ReceiptTypePlayedSelf:
+		return 5
+	case types.ReceiptTypeRetry:
+		return 1
+	default:
+		return -1
+	}
+}
+
+func (app *App) handleReceipt(receipt *events.Receipt) {
+	status := receiptTypeToStatus(receipt.Type)
+	if status < 0 {
+		return
+	}
+
+	chatJID := receipt.Chat.String()
+	for _, msgID := range receipt.MessageIDs {
+		if msgID == "" {
+			continue
+		}
+		fmt.Printf("[RECEIPT] id=%s chat=%s type=%s status=%d\n", msgID, chatJID, receipt.Type, status)
+		app.dispatchWebhook("messages.status", map[string]interface{}{
+			"id":           msgID,
+			"message_id":   msgID,
+			"status":       status,
+			"chat_jid":     chatJID,
+			"timestamp":    receipt.Timestamp.Unix(),
+			"receipt_type": string(receipt.Type),
+		})
 	}
 }
 
