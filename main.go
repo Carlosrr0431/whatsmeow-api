@@ -87,6 +87,13 @@ func NewApp() (*App, error) {
 func (app *App) eventHandler(evt interface{}) {
 	switch v := evt.(type) {
 	case *events.Message:
+		if v.Message == nil {
+			break
+		}
+		if v.Message.GetProtocolMessage() != nil || v.Message.GetSenderKeyDistributionMessage() != nil {
+			break
+		}
+
 		msg := MessageEvent{
 			ID:        v.Info.ID,
 			From:      v.Info.Sender.String(),
@@ -96,42 +103,11 @@ func (app *App) eventHandler(evt interface{}) {
 			IsFromMe:  v.Info.IsFromMe,
 			PushName:  v.Info.PushName,
 		}
-		fmt.Printf("[MSG] from=%s to=%s isFromMe=%v type=", msg.From, msg.To, msg.IsFromMe)
-
-		switch {
-		case v.Message.GetConversation() != "":
-			msg.Body = v.Message.GetConversation()
-			msg.Type = "text"
-		case v.Message.GetExtendedTextMessage() != nil:
-			msg.Body = v.Message.GetExtendedTextMessage().GetText()
-			msg.Type = "text"
-		case v.Message.GetImageMessage() != nil:
-			msg.Type = "image"
-			msg.Body = v.Message.GetImageMessage().GetCaption()
-		case v.Message.GetVideoMessage() != nil:
-			msg.Type = "video"
-			msg.Body = v.Message.GetVideoMessage().GetCaption()
-		case v.Message.GetDocumentMessage() != nil:
-			msg.Type = "document"
-			msg.Body = v.Message.GetDocumentMessage().GetFileName()
-		case v.Message.GetAudioMessage() != nil:
-			msg.Type = "audio"
-			if v.Message.GetAudioMessage().GetPTT() {
-				msg.Type = "ptt"
-			}
-		case v.Message.GetStickerMessage() != nil:
-			msg.Type = "sticker"
-		case v.Message.GetContactMessage() != nil:
-			msg.Type = "contact"
-			msg.Body = v.Message.GetContactMessage().GetDisplayName()
-		case v.Message.GetLocationMessage() != nil:
-			msg.Type = "location"
-			loc := v.Message.GetLocationMessage()
-			msg.Body = fmt.Sprintf("📍 %.6f, %.6f", loc.GetDegreesLatitude(), loc.GetDegreesLongitude())
-		default:
+		app.extractMessageContent(v.Message, &msg)
+		if msg.Type == "" {
 			msg.Type = "unknown"
 		}
-		fmt.Printf("%s body_len=%d\n", msg.Type, len(msg.Body))
+		fmt.Printf("[MSG] from=%s to=%s isFromMe=%v type=%s\n", msg.From, msg.To, msg.IsFromMe, msg.Type)
 
 		app.msgMu.Lock()
 		app.messages = append(app.messages, msg)
@@ -158,6 +134,50 @@ func (app *App) eventHandler(evt interface{}) {
 		app.client = nil
 		app.mu.Unlock()
 		fmt.Println("✗ WhatsApp logged out")
+
+	case *events.HistorySync:
+		if v.Data == nil {
+			break
+		}
+		count := 0
+		for _, conv := range v.Data.GetConversations() {
+			chatJID, err := types.ParseJID(conv.GetID())
+			if err != nil {
+				continue
+			}
+			for _, histMsg := range conv.GetMessages() {
+				evt, err := app.client.ParseWebMessage(chatJID, histMsg.GetMessage())
+				if err != nil || evt == nil {
+					continue
+				}
+				if evt.Message == nil || evt.Message.GetProtocolMessage() != nil || evt.Message.GetSenderKeyDistributionMessage() != nil {
+					continue
+				}
+				msg := MessageEvent{
+					ID:        evt.Info.ID,
+					From:      evt.Info.Sender.String(),
+					To:        evt.Info.Chat.String(),
+					Timestamp: evt.Info.Timestamp.Unix(),
+					IsGroup:   evt.Info.IsGroup,
+					IsFromMe:  evt.Info.IsFromMe,
+					PushName:  evt.Info.PushName,
+				}
+				app.extractMessageContent(evt.Message, &msg)
+				if msg.Type == "" {
+					msg.Type = "unknown"
+				}
+				app.msgMu.Lock()
+				app.messages = append(app.messages, msg)
+				app.msgMu.Unlock()
+				count++
+			}
+		}
+		app.msgMu.Lock()
+		if len(app.messages) > app.maxMsgHist {
+			app.messages = app.messages[len(app.messages)-app.maxMsgHist:]
+		}
+		app.msgMu.Unlock()
+		fmt.Printf("[HISTORY_SYNC] Loaded %d messages from history\n", count)
 	}
 }
 
@@ -786,6 +806,43 @@ func (app *App) handleSendGroupMessage(w http.ResponseWriter, r *http.Request) {
 			"timestamp":  resp.Timestamp.Unix(),
 		},
 	})
+}
+
+func (app *App) extractMessageContent(msg *waE2E.Message, evt *MessageEvent) {
+	if msg == nil {
+		return
+	}
+	switch {
+	case msg.GetConversation() != "":
+		evt.Body = msg.GetConversation()
+		evt.Type = "text"
+	case msg.GetExtendedTextMessage() != nil:
+		evt.Body = msg.GetExtendedTextMessage().GetText()
+		evt.Type = "text"
+	case msg.GetImageMessage() != nil:
+		evt.Type = "image"
+		evt.Body = msg.GetImageMessage().GetCaption()
+	case msg.GetVideoMessage() != nil:
+		evt.Type = "video"
+		evt.Body = msg.GetVideoMessage().GetCaption()
+	case msg.GetDocumentMessage() != nil:
+		evt.Type = "document"
+		evt.Body = msg.GetDocumentMessage().GetFileName()
+	case msg.GetAudioMessage() != nil:
+		evt.Type = "audio"
+		if msg.GetAudioMessage().GetPTT() {
+			evt.Type = "ptt"
+		}
+	case msg.GetStickerMessage() != nil:
+		evt.Type = "sticker"
+	case msg.GetContactMessage() != nil:
+		evt.Type = "contact"
+		evt.Body = msg.GetContactMessage().GetDisplayName()
+	case msg.GetLocationMessage() != nil:
+		evt.Type = "location"
+		loc := msg.GetLocationMessage()
+		evt.Body = fmt.Sprintf("📍 %.6f, %.6f", loc.GetDegreesLatitude(), loc.GetDegreesLongitude())
+	}
 }
 
 func (app *App) storeSentMessage(id string, toJID string, body string, msgType string, timestamp int64) {
