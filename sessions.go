@@ -205,7 +205,7 @@ func (sm *SessionManager) initSession(agentCode, webhookURL, webhookSecret strin
 	dbLog := waLog.Stdout("Database-"+safeAgentDir(agentCode), "WARN", true)
 	container, err := sqlstore.New(context.Background(), "sqlite3", dbPath, dbLog)
 	if err != nil {
-		return nil err
+		return nil, err
 	}
 
 	if webhookSecret == "" {
