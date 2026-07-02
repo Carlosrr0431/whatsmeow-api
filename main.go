@@ -96,41 +96,9 @@ func (app *App) eventHandler(evt interface{}) {
 			break
 		}
 
-		senderStr := v.Info.Sender.String()
-		chatStr := v.Info.Chat.String()
-		senderPN := ""
-		// Resolve phone numbers from Alt fields
-		if v.Info.SenderAlt.User != "" {
-			senderPN = v.Info.SenderAlt.User
-		}
-		chatJID := chatStr
-		if v.Info.Chat.Server == "lid" && v.Info.RecipientAlt.User != "" {
-			chatJID = v.Info.RecipientAlt.String()
-		}
-
-		msg := MessageEvent{
-			ID:        v.Info.ID,
-			From:      senderStr,
-			To:        chatStr,
-			ChatJID:   chatJID,
-			SenderPN:  senderPN,
-			Timestamp: v.Info.Timestamp.Unix(),
-			IsGroup:   v.Info.IsGroup,
-			IsFromMe:  v.Info.IsFromMe,
-			PushName:  v.Info.PushName,
-		}
-		app.extractMessageContent(v.Message, &msg)
-		if msg.Type == "" {
-			msg.Type = "unknown"
-		}
-		fmt.Printf("[MSG] from=%s to=%s isFromMe=%v type=%s\n", msg.From, msg.To, msg.IsFromMe, msg.Type)
-
-		app.msgMu.Lock()
-		app.messages = append(app.messages, msg)
-		if len(app.messages) > app.maxMsgHist {
-			app.messages = app.messages[len(app.messages)-app.maxMsgHist:]
-		}
-		app.msgMu.Unlock()
+		msg := app.messageFromEvent(v.Info, v.Message)
+		fmt.Printf("[MSG] from=%s to=%s chat=%s pn=%s isFromMe=%v type=%s\n", msg.From, msg.To, msg.ChatJID, msg.SenderPN, msg.IsFromMe, msg.Type)
+		app.appendMessage(msg)
 
 	case *events.Connected:
 		app.mu.Lock()
@@ -152,7 +120,34 @@ func (app *App) eventHandler(evt interface{}) {
 		fmt.Println("✗ WhatsApp logged out")
 
 	case *events.HistorySync:
-		fmt.Println("[HISTORY_SYNC] received (messages will be available from live events only)")
+		if v.Data == nil || app.client == nil {
+			break
+		}
+		count := 0
+		seen := make(map[string]bool)
+		for _, conv := range v.Data.GetConversations() {
+			chatJID, err := types.ParseJID(conv.GetId())
+			if err != nil {
+				continue
+			}
+			for _, histMsg := range conv.GetMessages() {
+				evt, err := app.client.ParseWebMessage(chatJID, histMsg.GetMessage())
+				if err != nil || evt == nil || evt.Message == nil {
+					continue
+				}
+				if evt.Message.GetProtocolMessage() != nil || evt.Message.GetSenderKeyDistributionMessage() != nil {
+					continue
+				}
+				msg := app.messageFromEvent(evt.Info, evt.Message)
+				if msg.ID == "" || seen[msg.ID] {
+					continue
+				}
+				seen[msg.ID] = true
+				app.appendMessage(msg)
+				count++
+			}
+		}
+		fmt.Printf("[HISTORY_SYNC] Loaded %d messages from history\n", count)
 	}
 }
 
@@ -510,15 +505,44 @@ func (app *App) handleGetContacts(w http.ResponseWriter, r *http.Request) {
 		Name     string `json:"name"`
 		FullName string `json:"full_name"`
 		Phone    string `json:"phone"`
+		LID      string `json:"lid,omitempty"`
 	}
 
 	contactList := make([]ContactInfo, 0, len(contacts))
+	seenPhones := make(map[string]bool)
+
 	for jid, info := range contacts {
+		phone := jid.User
+		lid := ""
+		displayJID := jid.String()
+
+		if jid.Server == types.HiddenUserServer {
+			lid = jid.User
+			if app.client != nil && app.client.Store != nil {
+				if pn, err := app.client.Store.LIDs.GetPNForLID(context.Background(), jid); err == nil && !pn.IsEmpty() {
+					phone = pn.User
+					displayJID = pn.String()
+				}
+			}
+		} else if jid.Server == types.DefaultUserServer && app.client != nil && app.client.Store != nil {
+			if mappedLID, err := app.client.Store.LIDs.GetLIDForPN(context.Background(), jid); err == nil && !mappedLID.IsEmpty() {
+				lid = mappedLID.User
+			}
+		}
+
+		if jid.Server == types.HiddenUserServer && seenPhones[phone] {
+			continue
+		}
+		if phone != "" {
+			seenPhones[phone] = true
+		}
+
 		contactList = append(contactList, ContactInfo{
-			JID:      jid.String(),
+			JID:      displayJID,
 			Name:     info.PushName,
 			FullName: info.FullName,
-			Phone:    jid.User,
+			Phone:    phone,
+			LID:      lid,
 		})
 	}
 
@@ -585,28 +609,21 @@ func (app *App) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 	defer app.msgMu.RUnlock()
 
 	chatFilter := r.URL.Query().Get("chat")
-	if chatFilter != "" {
-		normalizedFilter := strings.Split(chatFilter, "@")[0]
-
+	jidFilter := r.URL.Query().Get("jid")
+	if chatFilter != "" || jidFilter != "" {
+		matchKeys := app.buildChatMatchKeys(chatFilter, jidFilter)
 		filtered := make([]MessageEvent, 0)
 		for _, msg := range app.messages {
-			fromUser := strings.Split(msg.From, "@")[0]
-			toUser := strings.Split(msg.To, "@")[0]
-			chatUser := strings.Split(msg.ChatJID, "@")[0]
-			if fromUser == normalizedFilter || toUser == normalizedFilter || chatUser == normalizedFilter ||
-				msg.SenderPN == normalizedFilter ||
-				strings.Contains(msg.From, normalizedFilter) || strings.Contains(msg.To, normalizedFilter) ||
-				strings.Contains(msg.ChatJID, normalizedFilter) {
+			if app.messageMatchesChat(msg, matchKeys) {
 				filtered = append(filtered, msg)
 			}
 		}
 		writeJSON(w, http.StatusOK, APIResponse{
 			Success: true,
 			Data: map[string]interface{}{
-				"messages":        filtered,
-				"total":           len(filtered),
-				"chat":            chatFilter,
-				"total_in_memory": len(app.messages),
+				"messages": filtered,
+				"total":    len(filtered),
+				"chat":     chatFilter,
 			},
 		})
 		return
@@ -787,6 +804,107 @@ func (app *App) handleSendGroupMessage(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (app *App) messageFromEvent(info types.MessageInfo, message *waE2E.Message) MessageEvent {
+	senderPN := ""
+	if info.SenderAlt.User != "" {
+		senderPN = info.SenderAlt.User
+	}
+
+	chatJID := info.Chat.String()
+	if info.IsFromMe && info.RecipientAlt.User != "" {
+		chatJID = info.RecipientAlt.String()
+	} else if !info.IsGroup && !info.IsFromMe && info.SenderAlt.User != "" {
+		chatJID = info.SenderAlt.String()
+	} else if info.Chat.Server == types.HiddenUserServer && info.RecipientAlt.User != "" {
+		chatJID = info.RecipientAlt.String()
+	}
+
+	msg := MessageEvent{
+		ID:        info.ID,
+		From:      info.Sender.String(),
+		To:        info.Chat.String(),
+		ChatJID:   chatJID,
+		SenderPN:  senderPN,
+		Timestamp: info.Timestamp.Unix(),
+		IsGroup:   info.IsGroup,
+		IsFromMe:  info.IsFromMe,
+		PushName:  info.PushName,
+	}
+	app.extractMessageContent(message, &msg)
+	if msg.Type == "" {
+		msg.Type = "unknown"
+	}
+	return msg
+}
+
+func (app *App) appendMessage(msg MessageEvent) {
+	app.msgMu.Lock()
+	defer app.msgMu.Unlock()
+	for _, existing := range app.messages {
+		if existing.ID == msg.ID {
+			return
+		}
+	}
+	app.messages = append(app.messages, msg)
+	if len(app.messages) > app.maxMsgHist {
+		app.messages = app.messages[len(app.messages)-app.maxMsgHist:]
+	}
+}
+
+func (app *App) addMatchKey(keys map[string]bool, value string) {
+	if value == "" {
+		return
+	}
+	keys[value] = true
+	if idx := strings.Index(value, "@"); idx > 0 {
+		keys[value[:idx]] = true
+	}
+}
+
+func (app *App) buildChatMatchKeys(chatFilter, jidFilter string) map[string]bool {
+	keys := make(map[string]bool)
+	app.addMatchKey(keys, chatFilter)
+	app.addMatchKey(keys, jidFilter)
+
+	normalized := strings.Split(chatFilter, "@")[0]
+	if normalized == "" {
+		normalized = strings.Split(jidFilter, "@")[0]
+	}
+	if normalized == "" || app.client == nil || app.client.Store == nil {
+		return keys
+	}
+
+	phoneJID := types.NewJID(normalized, types.DefaultUserServer)
+	if lid, err := app.client.Store.LIDs.GetLIDForPN(context.Background(), phoneJID); err == nil && !lid.IsEmpty() {
+		app.addMatchKey(keys, lid.String())
+		app.addMatchKey(keys, lid.User)
+	}
+
+	lidJID := types.NewJID(normalized, types.HiddenUserServer)
+	if pn, err := app.client.Store.LIDs.GetPNForLID(context.Background(), lidJID); err == nil && !pn.IsEmpty() {
+		app.addMatchKey(keys, pn.String())
+		app.addMatchKey(keys, pn.User)
+	}
+
+	return keys
+}
+
+func (app *App) messageMatchesChat(msg MessageEvent, keys map[string]bool) bool {
+	fields := []string{msg.From, msg.To, msg.ChatJID, msg.SenderPN}
+	for _, field := range fields {
+		if field == "" {
+			continue
+		}
+		if keys[field] {
+			return true
+		}
+		if idx := strings.Index(field, "@"); idx > 0 && keys[field[:idx]] {
+			return true
+		}
+	}
+	return false
+}
+
 func (app *App) extractMessageContent(msg *waE2E.Message, evt *MessageEvent) {
 	if msg == nil {
 		return
@@ -833,6 +951,7 @@ func (app *App) storeSentMessage(id string, toJID string, body string, msgType s
 		ID:        id,
 		From:      myJID,
 		To:        toJID,
+		ChatJID:   toJID,
 		Body:      body,
 		Type:      msgType,
 		Timestamp: timestamp,
@@ -840,12 +959,7 @@ func (app *App) storeSentMessage(id string, toJID string, body string, msgType s
 		IsFromMe:  true,
 		PushName:  "Yo",
 	}
-	app.msgMu.Lock()
-	app.messages = append(app.messages, msg)
-	if len(app.messages) > app.maxMsgHist {
-		app.messages = app.messages[len(app.messages)-app.maxMsgHist:]
-	}
-	app.msgMu.Unlock()
+	app.appendMessage(msg)
 }
 
 // --- Helpers ---
