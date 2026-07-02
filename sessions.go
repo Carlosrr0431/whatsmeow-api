@@ -762,12 +762,12 @@ func extractMessageContent(msg *waE2E.Message, evt *MessageEvent) {
 		im := msg.GetImageMessage()
 		evt.Type = "image"
 		evt.Body = im.GetCaption()
-		fillMediaFields(evt, im.GetURL(), im.GetMimetype(), im.GetDirectPath(), im.GetMediaKey(), im.GetFileEncSha256(), im.GetFileSha256(), im.GetFileLength(), "", im.GetWidth(), im.GetHeight(), 0)
+		fillMediaFields(evt, im.GetURL(), im.GetMimetype(), im.GetDirectPath(), im.GetMediaKey(), im.GetFileEncSHA256(), im.GetFileSHA256(), im.GetFileLength(), "", im.GetWidth(), im.GetHeight(), 0)
 	case msg.GetVideoMessage() != nil:
 		vm := msg.GetVideoMessage()
 		evt.Type = "video"
 		evt.Body = vm.GetCaption()
-		fillMediaFields(evt, vm.GetURL(), vm.GetMimetype(), vm.GetDirectPath(), vm.GetMediaKey(), vm.GetFileEncSha256(), vm.GetFileSha256(), vm.GetFileLength(), "", vm.GetWidth(), vm.GetHeight(), vm.GetSeconds())
+		fillMediaFields(evt, vm.GetURL(), vm.GetMimetype(), vm.GetDirectPath(), vm.GetMediaKey(), vm.GetFileEncSHA256(), vm.GetFileSHA256(), vm.GetFileLength(), "", vm.GetWidth(), vm.GetHeight(), vm.GetSeconds())
 	case msg.GetDocumentMessage() != nil:
 		dm := msg.GetDocumentMessage()
 		evt.Type = "document"
@@ -775,18 +775,18 @@ func extractMessageContent(msg *waE2E.Message, evt *MessageEvent) {
 		if evt.Body == "" {
 			evt.Body = dm.GetFileName()
 		}
-		fillMediaFields(evt, dm.GetURL(), dm.GetMimetype(), dm.GetDirectPath(), dm.GetMediaKey(), dm.GetFileEncSha256(), dm.GetFileSha256(), dm.GetFileLength(), dm.GetFileName(), 0, 0, 0)
+		fillMediaFields(evt, dm.GetURL(), dm.GetMimetype(), dm.GetDirectPath(), dm.GetMediaKey(), dm.GetFileEncSHA256(), dm.GetFileSHA256(), dm.GetFileLength(), dm.GetFileName(), 0, 0, 0)
 	case msg.GetAudioMessage() != nil:
 		am := msg.GetAudioMessage()
 		evt.Type = "audio"
 		if am.GetPTT() {
 			evt.Type = "ptt"
 		}
-		fillMediaFields(evt, am.GetURL(), am.GetMimetype(), am.GetDirectPath(), am.GetMediaKey(), am.GetFileEncSha256(), am.GetFileSha256(), am.GetFileLength(), "", 0, 0, am.GetSeconds())
+		fillMediaFields(evt, am.GetURL(), am.GetMimetype(), am.GetDirectPath(), am.GetMediaKey(), am.GetFileEncSHA256(), am.GetFileSHA256(), am.GetFileLength(), "", 0, 0, am.GetSeconds())
 	case msg.GetStickerMessage() != nil:
 		sm := msg.GetStickerMessage()
 		evt.Type = "sticker"
-		fillMediaFields(evt, sm.GetURL(), sm.GetMimetype(), sm.GetDirectPath(), sm.GetMediaKey(), sm.GetFileEncSha256(), sm.GetFileSha256(), sm.GetFileLength(), "", sm.GetWidth(), sm.GetHeight(), 0)
+		fillMediaFields(evt, sm.GetURL(), sm.GetMimetype(), sm.GetDirectPath(), sm.GetMediaKey(), sm.GetFileEncSHA256(), sm.GetFileSHA256(), sm.GetFileLength(), "", sm.GetWidth(), sm.GetHeight(), 0)
 	case msg.GetContactMessage() != nil:
 		evt.Type = "contact"
 		evt.Body = msg.GetContactMessage().GetDisplayName()
