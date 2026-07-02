@@ -70,7 +70,7 @@ func NewApp() (*App, error) {
 	}
 
 	dbLog := waLog.Stdout("Database", "WARN", true)
-	container, err := sqlstore.New("sqlite3", dbPath, dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", dbPath, dbLog)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create store: %v", err)
 	}
@@ -162,7 +162,7 @@ func (app *App) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deviceStore, err := app.container.GetFirstDevice()
+	deviceStore, err := app.container.GetFirstDevice(context.Background())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, APIResponse{
 			Success: false,
@@ -301,7 +301,7 @@ func (app *App) handleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := app.client.Logout()
+	err := app.client.Logout(context.Background())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, APIResponse{
 			Success: false,
@@ -464,7 +464,7 @@ func (app *App) handleGetContacts(w http.ResponseWriter, r *http.Request) {
 	}
 	app.mu.RUnlock()
 
-	contacts, err := app.client.Store.Contacts.GetAllContacts()
+	contacts, err := app.client.Store.Contacts.GetAllContacts(context.Background())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, APIResponse{
 			Success: false,
@@ -511,7 +511,7 @@ func (app *App) handleGetGroups(w http.ResponseWriter, r *http.Request) {
 	}
 	app.mu.RUnlock()
 
-	groups, err := app.client.GetJoinedGroups()
+	groups, err := app.client.GetJoinedGroups(context.Background())
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, APIResponse{
 			Success: false,
@@ -583,7 +583,7 @@ func (app *App) handleGetProfilePic(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jid := parseJID(phone)
-	pic, err := app.client.GetProfilePictureInfo(jid, &whatsmeow.GetProfilePictureParams{})
+	pic, err := app.client.GetProfilePictureInfo(context.Background(), jid, &whatsmeow.GetProfilePictureParams{})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, APIResponse{
 			Success: false,
@@ -633,7 +633,7 @@ func (app *App) handleCheckNumber(w http.ResponseWriter, r *http.Request) {
 	}
 
 	phones := []string{phone}
-	resp, err := app.client.IsOnWhatsApp(phones)
+	resp, err := app.client.IsOnWhatsApp(context.Background(), phones)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, APIResponse{
 			Success: false,
@@ -837,7 +837,7 @@ func main() {
 	// Auto-connect on startup if session exists
 	go func() {
 		time.Sleep(2 * time.Second)
-		deviceStore, err := app.container.GetFirstDevice()
+		deviceStore, err := app.container.GetFirstDevice(context.Background())
 		if err == nil && deviceStore.ID != nil {
 			fmt.Println("Found existing session, auto-connecting...")
 			clientLog := waLog.Stdout("Client", "WARN", true)
