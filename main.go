@@ -552,6 +552,26 @@ func (app *App) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 	app.msgMu.RLock()
 	defer app.msgMu.RUnlock()
 
+	chatFilter := r.URL.Query().Get("chat")
+	if chatFilter != "" {
+		filtered := make([]MessageEvent, 0)
+		for _, msg := range app.messages {
+			if msg.From == chatFilter || msg.To == chatFilter ||
+				strings.Contains(msg.From, chatFilter) || strings.Contains(msg.To, chatFilter) {
+				filtered = append(filtered, msg)
+			}
+		}
+		writeJSON(w, http.StatusOK, APIResponse{
+			Success: true,
+			Data: map[string]interface{}{
+				"messages": filtered,
+				"total":    len(filtered),
+				"chat":     chatFilter,
+			},
+		})
+		return
+	}
+
 	writeJSON(w, http.StatusOK, APIResponse{
 		Success: true,
 		Data: map[string]interface{}{
