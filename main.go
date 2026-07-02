@@ -979,10 +979,14 @@ func (app *App) messageFromEvent(info types.MessageInfo, message *waE2E.Message)
 	chatJID := info.Chat.String()
 	if info.IsFromMe && info.RecipientAlt.User != "" {
 		chatJID = info.RecipientAlt.String()
+		senderPN = info.RecipientAlt.User
 	} else if !info.IsGroup && !info.IsFromMe && info.SenderAlt.User != "" {
 		chatJID = info.SenderAlt.String()
 	} else if info.Chat.Server == types.HiddenUserServer && info.RecipientAlt.User != "" {
 		chatJID = info.RecipientAlt.String()
+		if senderPN == "" {
+			senderPN = info.RecipientAlt.User
+		}
 	}
 
 	msg := MessageEvent{
