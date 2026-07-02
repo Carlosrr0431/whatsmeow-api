@@ -141,7 +141,7 @@ func (app *App) eventHandler(evt interface{}) {
 		}
 		count := 0
 		for _, conv := range v.Data.GetConversations() {
-			chatJID, err := types.ParseJID(conv.GetID())
+			chatJID, err := types.ParseJID(conv.GetId())
 			if err != nil {
 				continue
 			}
