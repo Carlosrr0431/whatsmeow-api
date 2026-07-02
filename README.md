@@ -28,6 +28,9 @@ git push -u origin main
 
 | Variable | Descripción | Default |
 |----------|-------------|---------|
+| `WEBHOOK_URL` | URL del webhook de Next.js (ej: `https://tu-app.vercel.app/api/whatsmeow-webhook/Remax_Oficina`) | — |
+| `WEBHOOK_SECRET` | Secret para autenticar el webhook (header `X-Webhook-Secret`) | — |
+| `AGENT_CODE` | Código del agente (se incluye en la URL del webhook) | — |
 | `PORT` | Puerto del servidor | `8080` |
 | `API_KEY` | Clave de autenticación (opcional) | _(vacío = sin auth)_ |
 | `DB_PATH` | Path de la base de datos SQLite | `file:/app/data/whatsapp.db?_foreign_keys=on` |

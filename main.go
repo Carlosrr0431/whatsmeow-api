@@ -25,15 +25,19 @@ import (
 )
 
 type App struct {
-	client     *whatsmeow.Client
-	container  *sqlstore.Container
-	qrCode     string
-	qrChan     <-chan whatsmeow.QRChannelItem
-	mu         sync.RWMutex
-	connected  bool
-	messages   []MessageEvent
-	msgMu      sync.RWMutex
-	maxMsgHist int
+	client      *whatsmeow.Client
+	container   *sqlstore.Container
+	qrCode      string
+	qrChan      <-chan whatsmeow.QRChannelItem
+	mu          sync.RWMutex
+	connected   bool
+	messages    []MessageEvent
+	msgMu       sync.RWMutex
+	maxMsgHist  int
+	webhookURL    string
+	webhookSecret string
+	agentCode     string
+	httpClient    *http.Client
 }
 
 type MessageEvent struct {
@@ -80,10 +84,49 @@ func NewApp() (*App, error) {
 	}
 
 	return &App{
-		container:  container,
-		maxMsgHist: 1000,
-		messages:   make([]MessageEvent, 0),
+		container:     container,
+		maxMsgHist:    1000,
+		messages:      make([]MessageEvent, 0),
+		webhookURL:    os.Getenv("WEBHOOK_URL"),
+		webhookSecret: os.Getenv("WEBHOOK_SECRET"),
+		agentCode:     os.Getenv("AGENT_CODE"),
+		httpClient:    &http.Client{Timeout: 15 * time.Second},
 	}, nil
+}
+
+// dispatchWebhook envía un evento al webhook configurado de forma asíncrona.
+func (app *App) dispatchWebhook(event string, data interface{}) {
+	if app.webhookURL == "" {
+		return
+	}
+	go func() {
+		payload, err := json.Marshal(map[string]interface{}{
+			"event": event,
+			"data":  data,
+		})
+		if err != nil {
+			fmt.Printf("[WEBHOOK] Error serializando payload: %v\n", err)
+			return
+		}
+
+		req, err := http.NewRequest("POST", app.webhookURL, strings.NewReader(string(payload)))
+		if err != nil {
+			fmt.Printf("[WEBHOOK] Error creando request: %v\n", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if app.webhookSecret != "" {
+			req.Header.Set("X-Webhook-Secret", app.webhookSecret)
+		}
+
+		resp, err := app.httpClient.Do(req)
+		if err != nil {
+			fmt.Printf("[WEBHOOK] Error enviando: %v\n", err)
+			return
+		}
+		defer resp.Body.Close()
+		fmt.Printf("[WEBHOOK] %s → %s: %d\n", event, app.webhookURL, resp.StatusCode)
+	}()
 }
 
 func (app *App) eventHandler(evt interface{}) {
@@ -99,18 +142,21 @@ func (app *App) eventHandler(evt interface{}) {
 		msg := app.messageFromEvent(v.Info, v.Message)
 		fmt.Printf("[MSG] from=%s to=%s chat=%s pn=%s isFromMe=%v type=%s\n", msg.From, msg.To, msg.ChatJID, msg.SenderPN, msg.IsFromMe, msg.Type)
 		app.appendMessage(msg)
+		app.dispatchWebhook("messages.upsert", msg)
 
 	case *events.Connected:
 		app.mu.Lock()
 		app.connected = true
 		app.mu.Unlock()
 		fmt.Println("✓ WhatsApp connected")
+		app.dispatchWebhook("session.status", map[string]string{"status": "connected"})
 
 	case *events.Disconnected:
 		app.mu.Lock()
 		app.connected = false
 		app.mu.Unlock()
 		fmt.Println("✗ WhatsApp disconnected")
+		app.dispatchWebhook("session.status", map[string]string{"status": "disconnected"})
 
 	case *events.LoggedOut:
 		app.mu.Lock()
@@ -118,6 +164,7 @@ func (app *App) eventHandler(evt interface{}) {
 		app.client = nil
 		app.mu.Unlock()
 		fmt.Println("✗ WhatsApp logged out")
+		app.dispatchWebhook("session.status", map[string]string{"status": "logged_out"})
 
 	case *events.HistorySync:
 		if v.Data == nil || app.client == nil {
@@ -688,6 +735,55 @@ func (app *App) handleGetProfilePic(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleWebhookConfig permite GET (ver config actual) y POST (actualizar config)
+func (app *App) handleWebhookConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, APIResponse{
+			Success: true,
+			Data: map[string]interface{}{
+				"webhook_url":    app.webhookURL,
+				"webhook_secret": func() string {
+					if app.webhookSecret != "" { return "***" }
+					return ""
+				}(),
+				"agent_code": app.agentCode,
+			},
+		})
+
+	case http.MethodPost:
+		var req struct {
+			WebhookURL    string `json:"webhook_url"`
+			WebhookSecret string `json:"webhook_secret"`
+			AgentCode     string `json:"agent_code"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "Invalid JSON"})
+			return
+		}
+		if req.WebhookURL != "" {
+			app.webhookURL = req.WebhookURL
+		}
+		if req.WebhookSecret != "" {
+			app.webhookSecret = req.WebhookSecret
+		}
+		if req.AgentCode != "" {
+			app.agentCode = req.AgentCode
+		}
+		writeJSON(w, http.StatusOK, APIResponse{
+			Success: true,
+			Message: "Webhook config updated",
+			Data: map[string]interface{}{
+				"webhook_url": app.webhookURL,
+				"agent_code":  app.agentCode,
+			},
+		})
+
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Success: false, Message: "Method not allowed"})
+	}
+}
+
 func (app *App) handleCheckNumber(w http.ResponseWriter, r *http.Request) {
 	app.mu.RLock()
 	if !app.connected || app.client == nil {
@@ -1071,6 +1167,9 @@ func main() {
 	// Utility endpoints
 	mux.HandleFunc("/api/check-number", app.handleCheckNumber)
 	mux.HandleFunc("/api/profile-pic", app.handleGetProfilePic)
+
+	// Webhook configuration endpoint
+	mux.HandleFunc("/api/webhook/config", app.handleWebhookConfig)
 
 	handler := corsMiddleware(authMiddleware(mux))
 
