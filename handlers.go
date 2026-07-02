@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/skip2/go-qrcode"
 	"go.mau.fi/whatsmeow"
@@ -417,6 +418,104 @@ func (app *App) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	msgs := s.Messages()
 	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"messages": msgs, "total": len(msgs)}})
+}
+
+func (app *App) handleDownloadMedia(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Success: false, Message: "Method not allowed"})
+		return
+	}
+	code, ok := requireAgentCode(w, r)
+	if !ok {
+		return
+	}
+	s, ok := app.manager.GetSession(code)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Message: "Session not found"})
+		return
+	}
+	client, connected := s.Client()
+	if !connected {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WhatsApp not connected"})
+		return
+	}
+
+	id := strings.TrimPrefix(r.URL.Path, "/api/messages/media/")
+	if idx := strings.Index(id, "/"); idx >= 0 {
+		id = id[:idx]
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "message id required"})
+		return
+	}
+
+	raw, ok := s.getRawMedia(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Message: "Media not found or expired from cache"})
+		return
+	}
+
+	unwrapped := unwrapMessage(raw)
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+
+	var (
+		data []byte
+		mime string
+		err  error
+	)
+
+	switch {
+	case unwrapped.GetImageMessage() != nil:
+		im := unwrapped.GetImageMessage()
+		data, err = client.Download(ctx, im)
+		mime = im.GetMimetype()
+	case unwrapped.GetVideoMessage() != nil:
+		vm := unwrapped.GetVideoMessage()
+		data, err = client.Download(ctx, vm)
+		mime = vm.GetMimetype()
+	case unwrapped.GetAudioMessage() != nil:
+		am := unwrapped.GetAudioMessage()
+		data, err = client.Download(ctx, am)
+		mime = am.GetMimetype()
+	case unwrapped.GetDocumentMessage() != nil:
+		dm := unwrapped.GetDocumentMessage()
+		data, err = client.Download(ctx, dm)
+		mime = dm.GetMimetype()
+	case unwrapped.GetStickerMessage() != nil:
+		sm := unwrapped.GetStickerMessage()
+		data, err = client.Download(ctx, sm)
+		mime = sm.GetMimetype()
+	default:
+		writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Message: "No downloadable media in message"})
+		return
+	}
+
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
+		return
+	}
+
+	if mime == "" {
+		switch r.URL.Query().Get("type") {
+		case "image", "sticker":
+			mime = "image/jpeg"
+		case "video":
+			mime = "video/mp4"
+		case "audio", "ptt":
+			mime = "audio/ogg"
+		case "document":
+			mime = "application/octet-stream"
+		default:
+			mime = http.DetectContentType(data)
+		}
+	}
+
+	w.Header().Set("Content-Type", mime)
+	w.Header().Set("Cache-Control", "private, max-age=3600")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
 }
 
 func (app *App) handleGetProfilePic(w http.ResponseWriter, r *http.Request) {

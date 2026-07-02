@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -17,9 +18,11 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
 )
 
 const maxMsgHist = 1000
+const maxRawMedia = 500
 
 type AgentRegistryEntry struct {
 	AgentCode     string `json:"agent_code"`
@@ -51,6 +54,8 @@ type AgentSession struct {
 	qrCode    string
 	connected bool
 	messages  []MessageEvent
+	rawMedia  map[string]*waE2E.Message
+	rawOrder  []string
 	mu        sync.RWMutex
 
 	manager    *SessionManager
@@ -218,6 +223,8 @@ func (sm *SessionManager) initSession(agentCode, webhookURL, webhookSecret strin
 		WebhookSecret: webhookSecret,
 		container:     container,
 		messages:      make([]MessageEvent, 0),
+		rawMedia:      make(map[string]*waE2E.Message),
+		rawOrder:      make([]string, 0),
 		manager:       sm,
 		httpClient:    sm.httpClient,
 	}
@@ -422,8 +429,11 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 			return
 		}
 		msg := messageFromEvent(v.Info, v.Message)
-		fmt.Printf("[MSG][%s] from=%s chat=%s pn=%s isFromMe=%v type=%s\n",
-			s.AgentCode, msg.From, msg.ChatJID, msg.SenderPN, msg.IsFromMe, msg.Type)
+		fmt.Printf("[MSG][%s] from=%s chat=%s pn=%s isFromMe=%v type=%s hasMedia=%v\n",
+			s.AgentCode, msg.From, msg.ChatJID, msg.SenderPN, msg.IsFromMe, msg.Type, msg.HasMedia)
+		if msg.HasMedia && v.Message != nil {
+			s.storeRawMedia(msg.ID, v.Message)
+		}
 		s.appendMessage(msg)
 		s.dispatchWebhook("messages.upsert", msg)
 
@@ -662,7 +672,82 @@ func messageFromEvent(info types.MessageInfo, message *waE2E.Message) MessageEve
 	return msg
 }
 
+func (s *AgentSession) storeRawMedia(id string, message *waE2E.Message) {
+	if id == "" || message == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.rawMedia[id]; !exists {
+		s.rawOrder = append(s.rawOrder, id)
+	}
+	s.rawMedia[id] = proto.Clone(message).(*waE2E.Message)
+	for len(s.rawOrder) > maxRawMedia {
+		oldest := s.rawOrder[0]
+		s.rawOrder = s.rawOrder[1:]
+		delete(s.rawMedia, oldest)
+	}
+}
+
+func (s *AgentSession) getRawMedia(id string) (*waE2E.Message, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	msg, ok := s.rawMedia[id]
+	return msg, ok
+}
+
+func b64(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(data)
+}
+
+func unwrapMessage(msg *waE2E.Message) *waE2E.Message {
+	if msg == nil {
+		return nil
+	}
+	switch {
+	case msg.GetEphemeralMessage() != nil:
+		return unwrapMessage(msg.GetEphemeralMessage().GetMessage())
+	case msg.GetViewOnceMessage() != nil:
+		return unwrapMessage(msg.GetViewOnceMessage().GetMessage())
+	case msg.GetViewOnceMessageV2() != nil:
+		return unwrapMessage(msg.GetViewOnceMessageV2().GetMessage())
+	case msg.GetDocumentWithCaptionMessage() != nil:
+		return unwrapMessage(msg.GetDocumentWithCaptionMessage().GetMessage())
+	case msg.GetEditedMessage() != nil:
+		return unwrapMessage(msg.GetEditedMessage().GetMessage())
+	default:
+		return msg
+	}
+}
+
+func fillMediaFields(evt *MessageEvent, url, mimetype, directPath string, mediaKey, fileEnc, fileSha []byte, fileLength uint64, fileName string, width, height, seconds uint32) {
+	evt.HasMedia = true
+	evt.MediaURL = url
+	evt.Mimetype = mimetype
+	evt.DirectPath = directPath
+	evt.MediaKey = b64(mediaKey)
+	evt.FileEncSHA256 = b64(fileEnc)
+	evt.FileSHA256 = b64(fileSha)
+	evt.FileLength = fileLength
+	if fileName != "" {
+		evt.FileName = fileName
+	}
+	if width > 0 {
+		evt.Width = width
+	}
+	if height > 0 {
+		evt.Height = height
+	}
+	if seconds > 0 {
+		evt.Seconds = seconds
+	}
+}
+
 func extractMessageContent(msg *waE2E.Message, evt *MessageEvent) {
+	msg = unwrapMessage(msg)
 	if msg == nil {
 		return
 	}
@@ -674,21 +759,34 @@ func extractMessageContent(msg *waE2E.Message, evt *MessageEvent) {
 		evt.Body = msg.GetExtendedTextMessage().GetText()
 		evt.Type = "text"
 	case msg.GetImageMessage() != nil:
+		im := msg.GetImageMessage()
 		evt.Type = "image"
-		evt.Body = msg.GetImageMessage().GetCaption()
+		evt.Body = im.GetCaption()
+		fillMediaFields(evt, im.GetURL(), im.GetMimetype(), im.GetDirectPath(), im.GetMediaKey(), im.GetFileEncSha256(), im.GetFileSha256(), im.GetFileLength(), "", im.GetWidth(), im.GetHeight(), 0)
 	case msg.GetVideoMessage() != nil:
+		vm := msg.GetVideoMessage()
 		evt.Type = "video"
-		evt.Body = msg.GetVideoMessage().GetCaption()
+		evt.Body = vm.GetCaption()
+		fillMediaFields(evt, vm.GetURL(), vm.GetMimetype(), vm.GetDirectPath(), vm.GetMediaKey(), vm.GetFileEncSha256(), vm.GetFileSha256(), vm.GetFileLength(), "", vm.GetWidth(), vm.GetHeight(), vm.GetSeconds())
 	case msg.GetDocumentMessage() != nil:
+		dm := msg.GetDocumentMessage()
 		evt.Type = "document"
-		evt.Body = msg.GetDocumentMessage().GetFileName()
+		evt.Body = dm.GetCaption()
+		if evt.Body == "" {
+			evt.Body = dm.GetFileName()
+		}
+		fillMediaFields(evt, dm.GetURL(), dm.GetMimetype(), dm.GetDirectPath(), dm.GetMediaKey(), dm.GetFileEncSha256(), dm.GetFileSha256(), dm.GetFileLength(), dm.GetFileName(), 0, 0, 0)
 	case msg.GetAudioMessage() != nil:
+		am := msg.GetAudioMessage()
 		evt.Type = "audio"
-		if msg.GetAudioMessage().GetPTT() {
+		if am.GetPTT() {
 			evt.Type = "ptt"
 		}
+		fillMediaFields(evt, am.GetURL(), am.GetMimetype(), am.GetDirectPath(), am.GetMediaKey(), am.GetFileEncSha256(), am.GetFileSha256(), am.GetFileLength(), "", 0, 0, am.GetSeconds())
 	case msg.GetStickerMessage() != nil:
+		sm := msg.GetStickerMessage()
 		evt.Type = "sticker"
+		fillMediaFields(evt, sm.GetURL(), sm.GetMimetype(), sm.GetDirectPath(), sm.GetMediaKey(), sm.GetFileEncSha256(), sm.GetFileSha256(), sm.GetFileLength(), "", sm.GetWidth(), sm.GetHeight(), 0)
 	case msg.GetContactMessage() != nil:
 		evt.Type = "contact"
 		evt.Body = msg.GetContactMessage().GetDisplayName()

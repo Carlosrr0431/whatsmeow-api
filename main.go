@@ -16,17 +16,29 @@ import (
 )
 
 type MessageEvent struct {
-	ID        string `json:"id"`
-	From      string `json:"from"`
-	To        string `json:"to"`
-	Body      string `json:"body"`
-	Type      string `json:"type"`
-	Timestamp int64  `json:"timestamp"`
-	IsGroup   bool   `json:"is_group"`
-	IsFromMe  bool   `json:"is_from_me"`
-	PushName  string `json:"push_name"`
-	ChatJID   string `json:"chat_jid"`
-	SenderPN  string `json:"sender_pn,omitempty"`
+	ID            string `json:"id"`
+	From          string `json:"from"`
+	To            string `json:"to"`
+	Body          string `json:"body"`
+	Type          string `json:"type"`
+	Timestamp     int64  `json:"timestamp"`
+	IsGroup       bool   `json:"is_group"`
+	IsFromMe      bool   `json:"is_from_me"`
+	PushName      string `json:"push_name"`
+	ChatJID       string `json:"chat_jid"`
+	SenderPN      string `json:"sender_pn,omitempty"`
+	MediaURL      string `json:"media_url,omitempty"`
+	Mimetype      string `json:"mimetype,omitempty"`
+	MediaKey      string `json:"media_key,omitempty"`
+	DirectPath    string `json:"direct_path,omitempty"`
+	FileEncSHA256 string `json:"file_enc_sha256,omitempty"`
+	FileSHA256    string `json:"file_sha256,omitempty"`
+	FileLength    uint64 `json:"file_length,omitempty"`
+	FileName      string `json:"file_name,omitempty"`
+	Width         uint32 `json:"width,omitempty"`
+	Height        uint32 `json:"height,omitempty"`
+	Seconds       uint32 `json:"seconds,omitempty"`
+	HasMedia      bool   `json:"has_media,omitempty"`
 }
 
 type APIResponse struct {
@@ -151,6 +163,7 @@ func main() {
 	mux.HandleFunc("/api/messages/send-image", app.handleSendImage)
 	mux.HandleFunc("/api/messages/send-group", app.handleSendGroupMessage)
 	mux.HandleFunc("/api/messages/history", app.handleGetMessages)
+	mux.HandleFunc("/api/messages/media/", app.handleDownloadMedia)
 	mux.HandleFunc("/api/contacts", app.handleGetContacts)
 	mux.HandleFunc("/api/groups", app.handleGetGroups)
 	mux.HandleFunc("/api/check-number", app.handleCheckNumber)
