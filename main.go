@@ -126,7 +126,7 @@ func (app *App) eventHandler(evt interface{}) {
 		count := 0
 		seen := make(map[string]bool)
 		for _, conv := range v.Data.GetConversations() {
-			chatJID, err := types.ParseJID(conv.GetId())
+			chatJID, err := types.ParseJID(conv.GetID())
 			if err != nil {
 				continue
 			}
