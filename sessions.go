@@ -447,7 +447,7 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 			s.handleProtocolMessage(v.Info, pm)
 			return
 		}
-		msg := messageFromEvent(v.Info, v.Message)
+		msg := s.messageFromEvent(v.Info, v.Message)
 		logVerbose("[MSG][%s] from=%s chat=%s pn=%s isFromMe=%v type=%s hasMedia=%v\n",
 			s.AgentCode, msg.From, msg.ChatJID, msg.SenderPN, msg.IsFromMe, msg.Type, msg.HasMedia)
 		if msg.HasMedia && v.Message != nil {
@@ -455,6 +455,9 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 		}
 		s.appendMessage(msg)
 		s.dispatchWebhook("messages.upsert", msg)
+
+	case *events.UndecryptableMessage:
+		s.handleUndecryptableMessage(v)
 
 	case *events.Receipt:
 		s.handleReceipt(v)
@@ -657,24 +660,91 @@ func (s *AgentSession) storeSentMessage(id, toJID, body, msgType string, timesta
 	s.appendMessage(msg)
 }
 
-func messageFromEvent(info types.MessageInfo, message *waE2E.Message) MessageEvent {
-	senderPN := ""
-	if info.SenderAlt.User != "" {
-		senderPN = info.SenderAlt.User
+func jidPhoneUser(jid types.JID) string {
+	if jid.Server == types.DefaultUserServer && jid.User != "" {
+		return jid.User
+	}
+	return ""
+}
+
+func (s *AgentSession) resolvePNFromLID(jid types.JID) (types.JID, string) {
+	if jid.IsEmpty() || jid.Server != types.HiddenUserServer {
+		return jid, ""
+	}
+	s.mu.RLock()
+	client := s.client
+	s.mu.RUnlock()
+	if client == nil {
+		return jid, ""
+	}
+	pn, err := client.Store.LIDs.GetPNForLID(context.Background(), jid)
+	if err != nil || pn.IsEmpty() {
+		return jid, ""
+	}
+	return pn, pn.User
+}
+
+func (s *AgentSession) resolveJIDToPhone(jid types.JID) string {
+	if phone := jidPhoneUser(jid); phone != "" {
+		return phone
+	}
+	if jid.Server == types.HiddenUserServer {
+		if _, phone := s.resolvePNFromLID(jid); phone != "" {
+			return phone
+		}
+	}
+	return ""
+}
+
+func (s *AgentSession) enrichJIDs(info types.MessageInfo) (chatJID, senderPN, senderLID string) {
+	if info.Sender.Server == types.HiddenUserServer {
+		senderLID = info.Sender.User
 	}
 
-	chatJID := info.Chat.String()
+	chatJID = info.Chat.String()
 	if info.IsFromMe && info.RecipientAlt.User != "" {
 		chatJID = info.RecipientAlt.String()
 		senderPN = info.RecipientAlt.User
 	} else if !info.IsGroup && !info.IsFromMe && info.SenderAlt.User != "" {
 		chatJID = info.SenderAlt.String()
+		senderPN = info.SenderAlt.User
 	} else if info.Chat.Server == types.HiddenUserServer && info.RecipientAlt.User != "" {
 		chatJID = info.RecipientAlt.String()
-		if senderPN == "" {
-			senderPN = info.RecipientAlt.User
+		senderPN = info.RecipientAlt.User
+	}
+
+	if senderPN == "" {
+		senderPN = s.resolveJIDToPhone(info.SenderAlt)
+	}
+	if senderPN == "" {
+		senderPN = s.resolveJIDToPhone(info.Sender)
+	}
+	if senderPN == "" && info.IsFromMe {
+		senderPN = s.resolveJIDToPhone(info.RecipientAlt)
+	}
+
+	if chatParsed, err := types.ParseJID(chatJID); err == nil {
+		if resolved, phone := s.resolvePNFromLID(chatParsed); phone != "" {
+			chatJID = resolved.String()
+			if senderPN == "" {
+				senderPN = phone
+			}
+		} else if phone := jidPhoneUser(chatParsed); phone != "" && chatJID == info.Chat.String() {
+			chatJID = chatParsed.String()
 		}
 	}
+
+	if senderPN == "" && chatJID != "" {
+		if chatParsed, err := types.ParseJID(chatJID); err == nil {
+			senderPN = s.resolveJIDToPhone(chatParsed)
+		}
+	}
+
+	return chatJID, senderPN, senderLID
+}
+
+func (s *AgentSession) messageFromEvent(info types.MessageInfo, message *waE2E.Message) MessageEvent {
+	chatJID, senderPN, senderLID := s.enrichJIDs(info)
 
 	msg := MessageEvent{
 		ID:        info.ID,
@@ -682,6 +752,7 @@ func messageFromEvent(info types.MessageInfo, message *waE2E.Message) MessageEve
 		To:        info.Chat.String(),
 		ChatJID:   chatJID,
 		SenderPN:  senderPN,
+		SenderLID: senderLID,
 		Timestamp: info.Timestamp.Unix(),
 		IsGroup:   info.IsGroup,
 		IsFromMe:  info.IsFromMe,
@@ -852,13 +923,19 @@ func extractTextFromMessage(msg *waE2E.Message) string {
 }
 
 func (s *AgentSession) senderPhone(info types.MessageInfo) string {
-	if info.IsFromMe && info.RecipientAlt.User != "" {
-		return info.RecipientAlt.User
+	_, senderPN, _ := s.enrichJIDs(info)
+	return senderPN
+}
+
+func (s *AgentSession) handleUndecryptableMessage(evt *events.UndecryptableMessage) {
+	if !shouldProcessChat(evt.Info) {
+		return
 	}
-	if info.SenderAlt.User != "" {
-		return info.SenderAlt.User
-	}
-	return info.Sender.User
+	chatJID, senderPN, senderLID := s.enrichJIDs(evt.Info)
+	fmt.Printf("[UNDECRYPTABLE][%s] id=%s from=%s chat=%s pn=%s lid=%s unavailable=%v type=%q\n",
+		s.AgentCode, evt.Info.ID, evt.Info.Sender, chatJID, senderPN, senderLID,
+		evt.IsUnavailable, evt.UnavailableType)
+	// whatsmeow reintenta automáticamente; si el remitente reenvía, llegará como Message normal.
 }
 
 func (s *AgentSession) handleReactionMessage(info types.MessageInfo, rm *waE2E.ReactionMessage) {

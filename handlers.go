@@ -833,3 +833,59 @@ func (app *App) handleSendReaction(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, APIResponse{Success: true, Message: "Reaction sent"})
 }
+
+func (app *App) handlePNFromLID(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Success: false, Message: "Method not allowed"})
+		return
+	}
+	code, ok := requireAgentCode(w, r)
+	if !ok {
+		return
+	}
+	s, ok := app.manager.GetSession(code)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Message: "Session not found"})
+		return
+	}
+	client, connected := s.Client()
+	if !connected {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WhatsApp not connected"})
+		return
+	}
+
+	lidStr := strings.TrimPrefix(r.URL.Path, "/api/pn-from-lid/")
+	lidStr = strings.Trim(lidStr, "/")
+	if lidStr == "" {
+		lidStr = r.URL.Query().Get("lid")
+	}
+	if lidStr == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "lid is required"})
+		return
+	}
+
+	jid, err := types.ParseJID(lidStr)
+	if err != nil || jid.Server != types.HiddenUserServer {
+		lidUser := strings.TrimSuffix(strings.TrimSuffix(lidStr, "@lid"), "@")
+		jid = types.NewJID(lidUser, types.HiddenUserServer)
+	}
+
+	pn, err := client.Store.LIDs.GetPNForLID(context.Background(), jid)
+	if err != nil || pn.IsEmpty() {
+		writeJSON(w, http.StatusNotFound, APIResponse{
+			Success: false,
+			Message: fmt.Sprintf("PN not found for LID %s", jid.String()),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data: map[string]interface{}{
+			"lid":   jid.User,
+			"phone": pn.User,
+			"pn":    pn.User,
+			"jid":   pn.String(),
+		},
+	})
+}

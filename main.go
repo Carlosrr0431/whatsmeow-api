@@ -27,6 +27,7 @@ type MessageEvent struct {
 	PushName      string `json:"push_name"`
 	ChatJID       string `json:"chat_jid"`
 	SenderPN      string `json:"sender_pn,omitempty"`
+	SenderLID     string `json:"sender_lid,omitempty"`
 	MediaURL      string `json:"media_url,omitempty"`
 	Mimetype      string `json:"mimetype,omitempty"`
 	MediaKey      string `json:"media_key,omitempty"`
@@ -173,6 +174,7 @@ func main() {
 	mux.HandleFunc("/api/groups", app.handleGetGroups)
 	mux.HandleFunc("/api/check-number", app.handleCheckNumber)
 	mux.HandleFunc("/api/profile-pic", app.handleGetProfilePic)
+	mux.HandleFunc("/api/pn-from-lid/", app.handlePNFromLID)
 	mux.HandleFunc("/api/webhook/config", app.handleWebhookConfig)
 
 	handler := corsMiddleware(authMiddleware(mux))
