@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,11 +20,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
-	"google.golang.org/protobuf/proto"
 )
-
-const maxMsgHist = 1000
-const maxRawMedia = 500
 
 type AgentRegistryEntry struct {
 	AgentCode     string `json:"agent_code"`
@@ -73,6 +71,10 @@ type SessionManager struct {
 }
 
 func NewSessionManager(dataDir, defaultSecret string) (*SessionManager, error) {
+	initRuntimeConfig()
+	fmt.Printf("[CONFIG] max_msg_history=%d max_raw_media=%d skip_groups=%v\n",
+		maxMsgHistLimit, maxRawMediaLimit, skipGroupsAndBroadcast)
+
 	if dataDir == "" {
 		dataDir = "/app/data"
 	}
@@ -206,7 +208,7 @@ func (sm *SessionManager) initSession(agentCode, webhookURL, webhookSecret strin
 		return nil, err
 	}
 
-	dbPath := "file:" + sm.sessionDBPath(agentCode) + "?_foreign_keys=on"
+	dbPath := "file:" + sm.sessionDBPath(agentCode) + "?_foreign_keys=on&_journal_mode=WAL&cache_size=-2000"
 	dbLog := waLog.Stdout("Database-"+safeAgentDir(agentCode), "WARN", true)
 	container, err := sqlstore.New(context.Background(), "sqlite3", dbPath, dbLog)
 	if err != nil {
@@ -400,7 +402,7 @@ func (s *AgentSession) dispatchWebhook(event string, data interface{}) {
 			return
 		}
 
-		req, err := http.NewRequest("POST", url, strings.NewReader(string(payload)))
+		req, err := http.NewRequest("POST", url, bytes.NewReader(payload))
 		if err != nil {
 			return
 		}
@@ -415,7 +417,8 @@ func (s *AgentSession) dispatchWebhook(event string, data interface{}) {
 			return
 		}
 		defer resp.Body.Close()
-		fmt.Printf("[WEBHOOK] %s %s → %s: %d\n", agentCode, event, url, resp.StatusCode)
+		_, _ = io.Copy(io.Discard, resp.Body)
+		logVerbose("[WEBHOOK] %s %s → %s: %d\n", agentCode, event, url, resp.StatusCode)
 	}()
 }
 
@@ -423,6 +426,10 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 	switch v := evt.(type) {
 	case *events.Message:
 		if v.Message == nil {
+			return
+		}
+		if !shouldProcessChat(v.Info) {
+			logVerbose("[SKIP][%s] grupo/broadcast chat=%s\n", s.AgentCode, v.Info.Chat.String())
 			return
 		}
 		if v.Message.GetSenderKeyDistributionMessage() != nil {
@@ -441,7 +448,7 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 			return
 		}
 		msg := messageFromEvent(v.Info, v.Message)
-		fmt.Printf("[MSG][%s] from=%s chat=%s pn=%s isFromMe=%v type=%s hasMedia=%v\n",
+		logVerbose("[MSG][%s] from=%s chat=%s pn=%s isFromMe=%v type=%s hasMedia=%v\n",
 			s.AgentCode, msg.From, msg.ChatJID, msg.SenderPN, msg.IsFromMe, msg.Type, msg.HasMedia)
 		if msg.HasMedia && v.Message != nil {
 			s.storeRawMedia(msg.ID, v.Message)
@@ -477,6 +484,9 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 }
 
 func (s *AgentSession) handleReceipt(receipt *events.Receipt) {
+	if skipGroupsAndBroadcast && (receipt.IsGroup || !shouldProcessChatJID(receipt.Chat.String())) {
+		return
+	}
 	status := receiptTypeToStatus(receipt.Type)
 	if status < 0 {
 		return
@@ -486,7 +496,7 @@ func (s *AgentSession) handleReceipt(receipt *events.Receipt) {
 		if msgID == "" {
 			continue
 		}
-		fmt.Printf("[RECEIPT][%s] id=%s chat=%s type=%s status=%d\n", s.AgentCode, msgID, chatJID, receipt.Type, status)
+		logVerbose("[RECEIPT][%s] id=%s chat=%s type=%s status=%d\n", s.AgentCode, msgID, chatJID, receipt.Type, status)
 		s.dispatchWebhook("messages.status", map[string]interface{}{
 			"id":           msgID,
 			"message_id":   msgID,
@@ -507,8 +517,8 @@ func (s *AgentSession) appendMessage(msg MessageEvent) {
 		}
 	}
 	s.messages = append(s.messages, msg)
-	if len(s.messages) > maxMsgHist {
-		s.messages = s.messages[len(s.messages)-maxMsgHist:]
+	if maxMsgHistLimit > 0 && len(s.messages) > maxMsgHistLimit {
+		s.messages = s.messages[len(s.messages)-maxMsgHistLimit:]
 	}
 }
 
@@ -685,7 +695,11 @@ func messageFromEvent(info types.MessageInfo, message *waE2E.Message) MessageEve
 }
 
 func (s *AgentSession) storeRawMedia(id string, message *waE2E.Message) {
-	if id == "" || message == nil {
+	if id == "" || message == nil || maxRawMediaLimit <= 0 {
+		return
+	}
+	slim := slimMediaMessage(message)
+	if slim == nil {
 		return
 	}
 	s.mu.Lock()
@@ -693,8 +707,8 @@ func (s *AgentSession) storeRawMedia(id string, message *waE2E.Message) {
 	if _, exists := s.rawMedia[id]; !exists {
 		s.rawOrder = append(s.rawOrder, id)
 	}
-	s.rawMedia[id] = proto.Clone(message).(*waE2E.Message)
-	for len(s.rawOrder) > maxRawMedia {
+	s.rawMedia[id] = slim
+	for len(s.rawOrder) > maxRawMediaLimit {
 		oldest := s.rawOrder[0]
 		s.rawOrder = s.rawOrder[1:]
 		delete(s.rawMedia, oldest)
@@ -853,7 +867,7 @@ func (s *AgentSession) handleReactionMessage(info types.MessageInfo, rm *waE2E.R
 		targetID = key.GetID()
 	}
 	fromPhone := s.senderPhone(info)
-	fmt.Printf("[REACTION][%s] target=%s emoji=%q from=%s\n", s.AgentCode, targetID, rm.GetText(), fromPhone)
+	logVerbose("[REACTION][%s] target=%s emoji=%q from=%s\n", s.AgentCode, targetID, rm.GetText(), fromPhone)
 	s.dispatchWebhook("messages.reaction", map[string]interface{}{
 		"reaction_target_id": targetID,
 		"target_id":          targetID,
@@ -890,7 +904,7 @@ func (s *AgentSession) handleProtocolMessage(info types.MessageInfo, pm *waE2E.P
 	}
 	switch pm.GetType() {
 	case waE2E.ProtocolMessage_REVOKE:
-		fmt.Printf("[REVOKE][%s] id=%s chat=%s\n", s.AgentCode, targetID, info.Chat.String())
+		logVerbose("[REVOKE][%s] id=%s chat=%s\n", s.AgentCode, targetID, info.Chat.String())
 		s.dispatchWebhook("messages.deleted", map[string]interface{}{
 			"id":         targetID,
 			"message_id": targetID,
@@ -900,7 +914,7 @@ func (s *AgentSession) handleProtocolMessage(info types.MessageInfo, pm *waE2E.P
 		})
 	case waE2E.ProtocolMessage_MESSAGE_EDIT:
 		newBody := extractTextFromMessage(pm.GetEditedMessage())
-		fmt.Printf("[EDIT][%s] id=%s body=%q\n", s.AgentCode, targetID, newBody)
+		logVerbose("[EDIT][%s] id=%s body=%q\n", s.AgentCode, targetID, newBody)
 		s.dispatchWebhook("messages.edit", map[string]interface{}{
 			"id":         targetID,
 			"message_id": targetID,

@@ -191,7 +191,8 @@ func main() {
 		Addr:         ":" + port,
 		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		WriteTimeout: 120 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	fmt.Printf("🚀 WhatsApp API Server (multi-session) starting on port %s\n", port)

@@ -15,6 +15,18 @@ API REST de WhatsApp usando [whatsmeow](https://github.com/tulir/whatsmeow). Un 
 | `PORT` | Puerto (default `8080`) |
 | `DATA_DIR` | Directorio de datos (default `/app/data`) |
 
+### Optimización de recursos (Railway)
+
+Variables opcionales para reducir memoria, CPU y egress:
+
+| Variable | Default | Descripción |
+|----------|---------|-------------|
+| `SKIP_GROUPS` | `true` | Ignora mensajes, recibos y webhooks de grupos, newsletters y broadcasts |
+| `MAX_MSG_HISTORY` | `100` | Mensajes en RAM por sesión (dashboard `/api/messages/history`) |
+| `MAX_RAW_MEDIA_CACHE` | `120` | Entradas de media en RAM para descarga on-demand |
+| `VERBOSE_LOGS` | `false` | Logs detallados por mensaje (activar solo para debug) |
+| `GOGC` | `80` | GC más frecuente → menos picos de RAM |
+
 **Ya no uses** `AGENT_CODE` ni `WEBHOOK_URL` fijos. Cada agente se registra vía `POST /api/webhook/config` con su `agent_code` y `webhook_url` (lo hace el dashboard al guardar el agente).
 
 ### Migración desde servidor monolítico
