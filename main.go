@@ -38,7 +38,9 @@ type MessageEvent struct {
 	Width         uint32 `json:"width,omitempty"`
 	Height        uint32 `json:"height,omitempty"`
 	Seconds       uint32 `json:"seconds,omitempty"`
-	HasMedia      bool   `json:"has_media,omitempty"`
+	HasMedia           bool   `json:"has_media,omitempty"`
+	ReactionTargetID   string `json:"reaction_target_id,omitempty"`
+	IsAnimatedSticker  bool   `json:"is_animated_sticker,omitempty"`
 }
 
 type APIResponse struct {
@@ -164,6 +166,9 @@ func main() {
 	mux.HandleFunc("/api/messages/send-group", app.handleSendGroupMessage)
 	mux.HandleFunc("/api/messages/history", app.handleGetMessages)
 	mux.HandleFunc("/api/messages/media/", app.handleDownloadMedia)
+	mux.HandleFunc("/api/messages/revoke", app.handleRevokeMessage)
+	mux.HandleFunc("/api/messages/edit", app.handleEditMessage)
+	mux.HandleFunc("/api/messages/reaction", app.handleSendReaction)
 	mux.HandleFunc("/api/contacts", app.handleGetContacts)
 	mux.HandleFunc("/api/groups", app.handleGetGroups)
 	mux.HandleFunc("/api/check-number", app.handleCheckNumber)

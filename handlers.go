@@ -712,3 +712,124 @@ func (app *App) handleWebhookConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Success: false, Message: "Method not allowed"})
 	}
 }
+
+func (app *App) handleRevokeMessage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Success: false, Message: "Method not allowed"})
+		return
+	}
+	var req struct {
+		AgentCode string `json:"agent_code"`
+		Phone     string `json:"phone"`
+		MessageID string `json:"message_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "Invalid request body"})
+		return
+	}
+	s, ok := app.sessionFromRequest(w, r, req.AgentCode)
+	if !ok {
+		return
+	}
+	client, connected := s.Client()
+	if !connected {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WhatsApp not connected"})
+		return
+	}
+	if req.Phone == "" || req.MessageID == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "phone and message_id are required"})
+		return
+	}
+	jid := parseJID(req.Phone)
+	_, err := client.SendMessage(context.Background(), jid, client.BuildRevoke(jid, types.EmptyJID, req.MessageID))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Message: "Message revoked", Data: map[string]interface{}{"message_id": req.MessageID}})
+}
+
+func (app *App) handleEditMessage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Success: false, Message: "Method not allowed"})
+		return
+	}
+	var req struct {
+		AgentCode string `json:"agent_code"`
+		Phone     string `json:"phone"`
+		MessageID string `json:"message_id"`
+		Message   string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "Invalid request body"})
+		return
+	}
+	s, ok := app.sessionFromRequest(w, r, req.AgentCode)
+	if !ok {
+		return
+	}
+	client, connected := s.Client()
+	if !connected {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WhatsApp not connected"})
+		return
+	}
+	if req.Phone == "" || req.MessageID == "" || req.Message == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "phone, message_id and message are required"})
+		return
+	}
+	jid := parseJID(req.Phone)
+	editMsg := client.BuildEdit(jid, req.MessageID, &waE2E.Message{Conversation: proto.String(req.Message)})
+	_, err := client.SendMessage(context.Background(), jid, editMsg)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Message: "Message edited", Data: map[string]interface{}{"message_id": req.MessageID}})
+}
+
+func (app *App) handleSendReaction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Success: false, Message: "Method not allowed"})
+		return
+	}
+	var req struct {
+		AgentCode string `json:"agent_code"`
+		Phone     string `json:"phone"`
+		MessageID string `json:"message_id"`
+		Reaction  string `json:"reaction"`
+		FromMe    bool   `json:"from_me"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "Invalid request body"})
+		return
+	}
+	s, ok := app.sessionFromRequest(w, r, req.AgentCode)
+	if !ok {
+		return
+	}
+	client, connected := s.Client()
+	if !connected {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WhatsApp not connected"})
+		return
+	}
+	if req.Phone == "" || req.MessageID == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "phone and message_id are required"})
+		return
+	}
+	jid := parseJID(req.Phone)
+	sender := types.EmptyJID
+	if req.FromMe {
+		s.mu.RLock()
+		if client.Store.ID != nil {
+			sender = *client.Store.ID
+		}
+		s.mu.RUnlock()
+	}
+	reactionMsg := client.BuildReaction(jid, sender, req.MessageID, req.Reaction)
+	_, err := client.SendMessage(context.Background(), jid, reactionMsg)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Message: "Reaction sent"})
+}

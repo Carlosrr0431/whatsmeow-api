@@ -425,7 +425,19 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 		if v.Message == nil {
 			return
 		}
-		if v.Message.GetProtocolMessage() != nil || v.Message.GetSenderKeyDistributionMessage() != nil {
+		if v.Message.GetSenderKeyDistributionMessage() != nil {
+			return
+		}
+		if v.Message.GetReactionMessage() != nil {
+			s.handleReactionMessage(v.Info, v.Message.GetReactionMessage())
+			return
+		}
+		if v.Message.GetEncReactionMessage() != nil {
+			s.handleEncReaction(v)
+			return
+		}
+		if pm := v.Message.GetProtocolMessage(); pm != nil {
+			s.handleProtocolMessage(v.Info, pm)
 			return
 		}
 		msg := messageFromEvent(v.Info, v.Message)
@@ -765,9 +777,20 @@ func extractMessageContent(msg *waE2E.Message, evt *MessageEvent) {
 		fillMediaFields(evt, im.GetURL(), im.GetMimetype(), im.GetDirectPath(), im.GetMediaKey(), im.GetFileEncSHA256(), im.GetFileSHA256(), im.GetFileLength(), "", im.GetWidth(), im.GetHeight(), 0)
 	case msg.GetVideoMessage() != nil:
 		vm := msg.GetVideoMessage()
-		evt.Type = "video"
-		evt.Body = vm.GetCaption()
-		fillMediaFields(evt, vm.GetURL(), vm.GetMimetype(), vm.GetDirectPath(), vm.GetMediaKey(), vm.GetFileEncSHA256(), vm.GetFileSHA256(), vm.GetFileLength(), "", vm.GetWidth(), vm.GetHeight(), vm.GetSeconds())
+		mime := vm.GetMimetype()
+		if vm.GetGifPlayback() || strings.Contains(mime, "webp") {
+			evt.Type = "sticker"
+			evt.IsAnimatedSticker = vm.GetGifPlayback()
+			fillMediaFields(evt, vm.GetURL(), mime, vm.GetDirectPath(), vm.GetMediaKey(), vm.GetFileEncSHA256(), vm.GetFileSHA256(), vm.GetFileLength(), "", vm.GetWidth(), vm.GetHeight(), vm.GetSeconds())
+		} else {
+			evt.Type = "video"
+			evt.Body = vm.GetCaption()
+			fillMediaFields(evt, vm.GetURL(), mime, vm.GetDirectPath(), vm.GetMediaKey(), vm.GetFileEncSHA256(), vm.GetFileSHA256(), vm.GetFileLength(), "", vm.GetWidth(), vm.GetHeight(), vm.GetSeconds())
+		}
+	case msg.GetStickerMessage() != nil:
+		sm := msg.GetStickerMessage()
+		evt.Type = "sticker"
+		fillMediaFields(evt, sm.GetURL(), sm.GetMimetype(), sm.GetDirectPath(), sm.GetMediaKey(), sm.GetFileEncSHA256(), sm.GetFileSHA256(), sm.GetFileLength(), "", sm.GetWidth(), sm.GetHeight(), 0)
 	case msg.GetDocumentMessage() != nil:
 		dm := msg.GetDocumentMessage()
 		evt.Type = "document"
@@ -783,10 +806,6 @@ func extractMessageContent(msg *waE2E.Message, evt *MessageEvent) {
 			evt.Type = "ptt"
 		}
 		fillMediaFields(evt, am.GetURL(), am.GetMimetype(), am.GetDirectPath(), am.GetMediaKey(), am.GetFileEncSHA256(), am.GetFileSHA256(), am.GetFileLength(), "", 0, 0, am.GetSeconds())
-	case msg.GetStickerMessage() != nil:
-		sm := msg.GetStickerMessage()
-		evt.Type = "sticker"
-		fillMediaFields(evt, sm.GetURL(), sm.GetMimetype(), sm.GetDirectPath(), sm.GetMediaKey(), sm.GetFileEncSHA256(), sm.GetFileSHA256(), sm.GetFileLength(), "", sm.GetWidth(), sm.GetHeight(), 0)
 	case msg.GetContactMessage() != nil:
 		evt.Type = "contact"
 		evt.Body = msg.GetContactMessage().GetDisplayName()
@@ -794,5 +813,102 @@ func extractMessageContent(msg *waE2E.Message, evt *MessageEvent) {
 		evt.Type = "location"
 		loc := msg.GetLocationMessage()
 		evt.Body = fmt.Sprintf("📍 %.6f, %.6f", loc.GetDegreesLatitude(), loc.GetDegreesLongitude())
+	case msg.GetReactionMessage() != nil:
+		rm := msg.GetReactionMessage()
+		evt.Type = "reaction"
+		evt.Body = rm.GetText()
+		if key := rm.GetKey(); key != nil {
+			evt.ReactionTargetID = key.GetID()
+		}
+	}
+}
+
+func extractTextFromMessage(msg *waE2E.Message) string {
+	msg = unwrapMessage(msg)
+	if msg == nil {
+		return ""
+	}
+	if c := msg.GetConversation(); c != "" {
+		return c
+	}
+	if e := msg.GetExtendedTextMessage(); e != nil {
+		return e.GetText()
+	}
+	return ""
+}
+
+func (s *AgentSession) senderPhone(info types.MessageInfo) string {
+	if info.IsFromMe && info.RecipientAlt.User != "" {
+		return info.RecipientAlt.User
+	}
+	if info.SenderAlt.User != "" {
+		return info.SenderAlt.User
+	}
+	return info.Sender.User
+}
+
+func (s *AgentSession) handleReactionMessage(info types.MessageInfo, rm *waE2E.ReactionMessage) {
+	targetID := ""
+	if key := rm.GetKey(); key != nil {
+		targetID = key.GetID()
+	}
+	fromPhone := s.senderPhone(info)
+	fmt.Printf("[REACTION][%s] target=%s emoji=%q from=%s\n", s.AgentCode, targetID, rm.GetText(), fromPhone)
+	s.dispatchWebhook("messages.reaction", map[string]interface{}{
+		"reaction_target_id": targetID,
+		"target_id":          targetID,
+		"id":                 targetID,
+		"emoji":              rm.GetText(),
+		"body":               rm.GetText(),
+		"from_phone":         fromPhone,
+		"sender_pn":          fromPhone,
+		"is_from_me":         info.IsFromMe,
+		"chat_jid":           info.Chat.String(),
+		"timestamp":          info.Timestamp.Unix(),
+	})
+}
+
+func (s *AgentSession) handleEncReaction(evt *events.Message) {
+	s.mu.RLock()
+	client := s.client
+	s.mu.RUnlock()
+	if client == nil {
+		return
+	}
+	rm, err := client.DecryptReaction(context.Background(), evt)
+	if err != nil || rm == nil {
+		fmt.Printf("[REACTION][%s] decrypt error: %v\n", s.AgentCode, err)
+		return
+	}
+	s.handleReactionMessage(evt.Info, rm)
+}
+
+func (s *AgentSession) handleProtocolMessage(info types.MessageInfo, pm *waE2E.ProtocolMessage) {
+	targetID := ""
+	if key := pm.GetKey(); key != nil {
+		targetID = key.GetID()
+	}
+	switch pm.GetType() {
+	case waE2E.ProtocolMessage_REVOKE:
+		fmt.Printf("[REVOKE][%s] id=%s chat=%s\n", s.AgentCode, targetID, info.Chat.String())
+		s.dispatchWebhook("messages.deleted", map[string]interface{}{
+			"id":         targetID,
+			"message_id": targetID,
+			"chat_jid":   info.Chat.String(),
+			"timestamp":  info.Timestamp.Unix(),
+			"is_from_me": info.IsFromMe,
+		})
+	case waE2E.ProtocolMessage_MESSAGE_EDIT:
+		newBody := extractTextFromMessage(pm.GetEditedMessage())
+		fmt.Printf("[EDIT][%s] id=%s body=%q\n", s.AgentCode, targetID, newBody)
+		s.dispatchWebhook("messages.edit", map[string]interface{}{
+			"id":         targetID,
+			"message_id": targetID,
+			"body":       newBody,
+			"content":    newBody,
+			"chat_jid":   info.Chat.String(),
+			"timestamp":  info.Timestamp.Unix(),
+			"is_from_me": info.IsFromMe,
+		})
 	}
 }
