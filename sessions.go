@@ -406,7 +406,7 @@ func (s *AgentSession) dispatchWebhook(event string, data interface{}) {
 		if err != nil {
 			return
 		}
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", "application/json; charset=utf-8")
 		if secret != "" {
 			req.Header.Set("X-Webhook-Secret", secret)
 		}
