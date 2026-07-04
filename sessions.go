@@ -54,6 +54,8 @@ type AgentSession struct {
 	messages  []MessageEvent
 	rawMedia  map[string]*waE2E.Message
 	rawOrder  []string
+	undecryptableSeen map[string]struct{}
+	undecryptableOrder []string
 	mu        sync.RWMutex
 
 	manager    *SessionManager
@@ -72,8 +74,8 @@ type SessionManager struct {
 
 func NewSessionManager(dataDir, defaultSecret string) (*SessionManager, error) {
 	initRuntimeConfig()
-	fmt.Printf("[CONFIG] max_msg_history=%d max_raw_media=%d skip_groups=%v\n",
-		maxMsgHistLimit, maxRawMediaLimit, skipGroupsAndBroadcast)
+	fmt.Printf("[CONFIG] max_msg_history=%d max_raw_media=%d skip_groups=%v client_log=%s sqlite_busy_ms=%d connect_stagger_sec=%d\n",
+		maxMsgHistLimit, maxRawMediaLimit, skipGroupsAndBroadcast, clientLogLevel, sqliteBusyTimeoutMS, autoConnectStaggerSec)
 
 	if dataDir == "" {
 		dataDir = "/app/data"
@@ -195,6 +197,23 @@ func (sm *SessionManager) migrateLegacySession() {
 	fmt.Printf("[SESSIONS] Migrated legacy config for agent %s\n", agentCode)
 }
 
+func (sm *SessionManager) sqliteDSN(agentCode string) string {
+	path := sm.sessionDBPath(agentCode)
+	return fmt.Sprintf(
+		"file:%s?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=%d&_synchronous=NORMAL&cache_size=-2000",
+		path, sqliteBusyTimeoutMS,
+	)
+}
+
+func newClientLogger(agentCode string) waLog.Logger {
+	return waLog.Stdout("Client-"+safeAgentDir(agentCode), clientLogLevel, true)
+}
+
+func configureWhatsAppClient(client *whatsmeow.Client) {
+	client.EnableAutoReconnect = true
+	client.InitialAutoReconnect = true
+}
+
 func (sm *SessionManager) initSession(agentCode, webhookURL, webhookSecret string) (*AgentSession, error) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -208,8 +227,8 @@ func (sm *SessionManager) initSession(agentCode, webhookURL, webhookSecret strin
 		return nil, err
 	}
 
-	dbPath := "file:" + sm.sessionDBPath(agentCode) + "?_foreign_keys=on&_journal_mode=WAL&cache_size=-2000"
-	dbLog := waLog.Stdout("Database-"+safeAgentDir(agentCode), "WARN", true)
+	dbPath := sm.sqliteDSN(agentCode)
+	dbLog := waLog.Stdout("Database-"+safeAgentDir(agentCode), "ERROR", true)
 	container, err := sqlstore.New(context.Background(), "sqlite3", dbPath, dbLog)
 	if err != nil {
 		return nil, err
@@ -227,6 +246,8 @@ func (sm *SessionManager) initSession(agentCode, webhookURL, webhookSecret strin
 		messages:      make([]MessageEvent, 0),
 		rawMedia:      make(map[string]*waE2E.Message),
 		rawOrder:      make([]string, 0),
+		undecryptableSeen: make(map[string]struct{}),
+		undecryptableOrder: make([]string, 0),
 		manager:       sm,
 		httpClient:    sm.httpClient,
 	}
@@ -322,7 +343,10 @@ func (sm *SessionManager) AutoConnectAll() {
 	}
 	sm.mu.RUnlock()
 
-	for _, code := range codes {
+	for i, code := range codes {
+		if i > 0 && autoConnectStaggerSec > 0 {
+			time.Sleep(time.Duration(autoConnectStaggerSec) * time.Second)
+		}
 		s, ok := sm.GetSession(code)
 		if !ok {
 			continue
@@ -465,6 +489,9 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 	case *events.Connected:
 		s.mu.Lock()
 		s.connected = true
+		if s.client != nil {
+			s.client.AutoReconnectErrors = 0
+		}
 		s.mu.Unlock()
 		fmt.Printf("✓ [%s] WhatsApp connected\n", s.AgentCode)
 		s.dispatchWebhook("session.status", map[string]string{"status": "connected"})
@@ -532,7 +559,7 @@ func (s *AgentSession) connectExisting() error {
 		return nil
 	}
 
-	clientLog := waLog.Stdout("Client-"+safeAgentDir(s.AgentCode), "WARN", true)
+	clientLog := newClientLogger(s.AgentCode)
 	deviceStore, err := s.container.GetFirstDevice(context.Background())
 	if err != nil {
 		s.mu.Unlock()
@@ -540,6 +567,7 @@ func (s *AgentSession) connectExisting() error {
 	}
 
 	client := whatsmeow.NewClient(deviceStore, clientLog)
+	configureWhatsAppClient(client)
 	client.AddEventHandler(s.eventHandler)
 	s.client = client
 	s.mu.Unlock()
@@ -560,8 +588,9 @@ func (s *AgentSession) Connect() (needsQR bool, err error) {
 		return false, err
 	}
 
-	clientLog := waLog.Stdout("Client-"+safeAgentDir(s.AgentCode), "WARN", true)
+	clientLog := newClientLogger(s.AgentCode)
 	client := whatsmeow.NewClient(deviceStore, clientLog)
+	configureWhatsAppClient(client)
 	client.AddEventHandler(s.eventHandler)
 	s.client = client
 
@@ -667,7 +696,33 @@ func jidPhoneUser(jid types.JID) string {
 	return ""
 }
 
+func stripDeviceFromUser(user string) string {
+	if idx := strings.Index(user, ":"); idx > 0 {
+		return user[:idx]
+	}
+	return user
+}
+
+func normalizeLIDJID(jid types.JID) types.JID {
+	if jid.IsEmpty() || jid.Server != types.HiddenUserServer {
+		return jid
+	}
+	user := stripDeviceFromUser(jid.User)
+	if user == jid.User {
+		return jid
+	}
+	return types.NewJID(user, types.HiddenUserServer)
+}
+
+func lidUserFromJID(jid types.JID) string {
+	if jid.Server != types.HiddenUserServer {
+		return ""
+	}
+	return stripDeviceFromUser(jid.User)
+}
+
 func (s *AgentSession) resolvePNFromLID(jid types.JID) (types.JID, string) {
+	jid = normalizeLIDJID(jid)
 	if jid.IsEmpty() || jid.Server != types.HiddenUserServer {
 		return jid, ""
 	}
@@ -698,7 +753,9 @@ func (s *AgentSession) resolveJIDToPhone(jid types.JID) string {
 
 func (s *AgentSession) enrichJIDs(info types.MessageInfo) (chatJID, senderPN, senderLID string) {
 	if info.Sender.Server == types.HiddenUserServer {
-		senderLID = info.Sender.User
+		senderLID = lidUserFromJID(info.Sender)
+	} else if info.SenderAlt.Server == types.HiddenUserServer {
+		senderLID = lidUserFromJID(info.SenderAlt)
 	}
 
 	chatJID = info.Chat.String()
@@ -927,15 +984,57 @@ func (s *AgentSession) senderPhone(info types.MessageInfo) string {
 	return senderPN
 }
 
+func (s *AgentSession) rememberUndecryptable(id string) bool {
+	if id == "" {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, seen := s.undecryptableSeen[id]; seen {
+		return false
+	}
+	s.undecryptableSeen[id] = struct{}{}
+	s.undecryptableOrder = append(s.undecryptableOrder, id)
+	const maxUndecryptableSeen = 500
+	for len(s.undecryptableOrder) > maxUndecryptableSeen {
+		oldest := s.undecryptableOrder[0]
+		s.undecryptableOrder = s.undecryptableOrder[1:]
+		delete(s.undecryptableSeen, oldest)
+	}
+	return true
+}
+
 func (s *AgentSession) handleUndecryptableMessage(evt *events.UndecryptableMessage) {
+	chatJID, senderPN, senderLID := s.enrichJIDs(evt.Info)
 	if !shouldProcessChat(evt.Info) {
+		logVerbose("[SKIP-UNDECRYPTABLE][%s] id=%s chat=%s\n", s.AgentCode, evt.Info.ID, chatJID)
 		return
 	}
-	chatJID, senderPN, senderLID := s.enrichJIDs(evt.Info)
-	fmt.Printf("[UNDECRYPTABLE][%s] id=%s from=%s chat=%s pn=%s lid=%s unavailable=%v type=%q\n",
-		s.AgentCode, evt.Info.ID, evt.Info.Sender, chatJID, senderPN, senderLID,
-		evt.IsUnavailable, evt.UnavailableType)
-	// whatsmeow reintenta automáticamente; si el remitente reenvía, llegará como Message normal.
+	firstLog := s.rememberUndecryptable(evt.Info.ID)
+	if firstLog {
+		fmt.Printf("[UNDECRYPTABLE][%s] id=%s from=%s chat=%s pn=%s lid=%s unavailable=%v type=%q\n",
+			s.AgentCode, evt.Info.ID, evt.Info.Sender, chatJID, senderPN, senderLID,
+			evt.IsUnavailable, evt.UnavailableType)
+	} else {
+		logVerbose("[UNDECRYPTABLE-RETRY][%s] id=%s pn=%s\n", s.AgentCode, evt.Info.ID, senderPN)
+	}
+
+	// whatsmeow ya envía retry receipts; avisamos al CRM para chats 1:1 con teléfono resuelto.
+	if senderPN != "" {
+		s.dispatchWebhook("messages.undecryptable", map[string]interface{}{
+			"id":               evt.Info.ID,
+			"message_id":       evt.Info.ID,
+			"from":             evt.Info.Sender.String(),
+			"chat_jid":         chatJID,
+			"sender_pn":        senderPN,
+			"sender_lid":       senderLID,
+			"push_name":        evt.Info.PushName,
+			"timestamp":        evt.Info.Timestamp.Unix(),
+			"is_unavailable":   evt.IsUnavailable,
+			"unavailable_type": string(evt.UnavailableType),
+			"is_from_me":       evt.Info.IsFromMe,
+		})
+	}
 }
 
 func (s *AgentSession) handleReactionMessage(info types.MessageInfo, rm *waE2E.ReactionMessage) {

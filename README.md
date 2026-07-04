@@ -25,6 +25,9 @@ Variables opcionales para reducir memoria, CPU y egress:
 | `MAX_MSG_HISTORY` | `100` | Mensajes en RAM por sesión (dashboard `/api/messages/history`) |
 | `MAX_RAW_MEDIA_CACHE` | `120` | Entradas de media en RAM para descarga on-demand |
 | `VERBOSE_LOGS` | `false` | Logs detallados por mensaje (activar solo para debug) |
+| `CLIENT_LOG_LEVEL` | `ERROR` (o `WARN` si `VERBOSE_LOGS=true`) | Nivel de logs internos de whatsmeow por sesión |
+| `SQLITE_BUSY_TIMEOUT_MS` | `15000` | Espera ante `database is locked` (multi-sesión en un solo volumen) |
+| `AUTO_CONNECT_STAGGER_SEC` | `3` | Segundos entre reconexiones al arrancar (evita picos de SQLite) |
 | `GOGC` | `80` | GC más frecuente → menos picos de RAM |
 
 **Ya no uses** `AGENT_CODE` ni `WEBHOOK_URL` fijos. Cada agente se registra vía `POST /api/webhook/config` con su `agent_code` y `webhook_url` (lo hace el dashboard al guardar el agente).
@@ -96,3 +99,38 @@ go run .
 ```
 
 Servidor en `http://localhost:8080`.
+
+## Logs en Railway — qué es normal y qué hacer
+
+### Normal (no requiere acción)
+
+| Log | Significado |
+|-----|-------------|
+| `Error reading from websocket ... EOF` | Corte de red con WhatsApp; whatsmeow reconecta solo (`✓ connected` después) |
+| `Got 503 stream error, assuming automatic reconnect` | WhatsApp cerró el stream; reconexión automática |
+| `✗ disconnected` → `✓ connected` | Ciclo de reconexión exitoso |
+| `Error decrypting ... @g.us` / `status@broadcast` / `@newsletter` | Grupos, estados o newsletters con `SKIP_GROUPS=true` (no van al CRM) |
+| `Set status notification has unexpected content` | Aviso interno de WhatsApp; ignorar |
+| `Got untrusted identity error ... clearing stored identity` | whatsmeow resetea la sesión Signal y reintenta (automático) |
+
+### Atención — mensajes `[UNDECRYPTABLE]` en chats 1:1
+
+Ocurre cuando WhatsApp envía el mensaje cifrado pero la sesión Signal aún no puede descifrarlo (común con contactos `@lid`, anuncios de Meta o tras mucho tiempo offline).
+
+**Qué hace el servidor:**
+1. whatsmeow envía *retry receipts* al teléfono del remitente (hasta 5 intentos).
+2. Si se resuelve el teléfono (`pn=549...`), se dispara webhook `messages.undecryptable` al dashboard.
+3. Si luego llega el mensaje descifrado, llega como `messages.upsert` normal.
+
+**Si el mismo contacto repite `[UNDECRYPTABLE]` sin que llegue el mensaje:**
+1. En el dashboard, desconectá y volvé a escanear el QR de ese agente (`POST /api/session/logout` + nuevo QR).
+2. Pedile al contacto que reenvíe el mensaje.
+3. Verificá que el volumen de Railway esté montado en `/app/data` (sin volumen se pierden claves Signal al reiniciar).
+
+### `mismatching MAC in signal message`
+
+Sesión de cifrado desincronizada (mensaje viejo, otro dispositivo, o DB corrupta). whatsmeow reintenta; si persiste para un agente, logout + nuevo QR suele resolverlo.
+
+### Multi-sesión en un solo servicio
+
+Cada agente tiene su propio `whatsapp.db` bajo `/app/data/sessions/{agent_code}/`. Con varios agentes, `SQLITE_BUSY_TIMEOUT_MS` y `AUTO_CONNECT_STAGGER_SEC` reducen contención al arrancar.

@@ -867,8 +867,10 @@ func (app *App) handlePNFromLID(w http.ResponseWriter, r *http.Request) {
 	jid, err := types.ParseJID(lidStr)
 	if err != nil || jid.Server != types.HiddenUserServer {
 		lidUser := strings.TrimSuffix(strings.TrimSuffix(lidStr, "@lid"), "@")
+		lidUser = stripDeviceFromUser(lidUser)
 		jid = types.NewJID(lidUser, types.HiddenUserServer)
 	}
+	jid = normalizeLIDJID(jid)
 
 	pn, err := client.Store.LIDs.GetPNForLID(context.Background(), jid)
 	if err != nil || pn.IsEmpty() {

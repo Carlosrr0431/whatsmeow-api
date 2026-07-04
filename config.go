@@ -13,6 +13,9 @@ var (
 	maxRawMediaLimit       int
 	skipGroupsAndBroadcast bool
 	verboseLogs            bool
+	clientLogLevel         string
+	sqliteBusyTimeoutMS    int
+	autoConnectStaggerSec  int
 )
 
 func initRuntimeConfig() {
@@ -20,6 +23,16 @@ func initRuntimeConfig() {
 	maxRawMediaLimit = envInt("MAX_RAW_MEDIA_CACHE", 120)
 	skipGroupsAndBroadcast = envBool("SKIP_GROUPS", true)
 	verboseLogs = envBool("VERBOSE_LOGS", false)
+	sqliteBusyTimeoutMS = envInt("SQLITE_BUSY_TIMEOUT_MS", 15000)
+	autoConnectStaggerSec = envInt("AUTO_CONNECT_STAGGER_SEC", 3)
+	clientLogLevel = strings.TrimSpace(strings.ToUpper(os.Getenv("CLIENT_LOG_LEVEL")))
+	if clientLogLevel == "" {
+		if verboseLogs {
+			clientLogLevel = "WARN"
+		} else {
+			clientLogLevel = "ERROR"
+		}
+	}
 }
 
 func envInt(key string, def int) int {

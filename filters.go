@@ -26,16 +26,21 @@ func shouldProcessChatJID(chatJID string) bool {
 	if chatJID == "" {
 		return true
 	}
+	return !isIgnoredChatJID(chatJID)
+}
+
+// isIgnoredChatJID detecta chats que el CRM no procesa (grupos, estados, newsletters).
+func isIgnoredChatJID(chatJID string) bool {
 	if strings.Contains(chatJID, "@g.us") {
-		return false
+		return true
 	}
 	if strings.Contains(chatJID, "@broadcast") {
-		return false
+		return true
 	}
 	if strings.HasSuffix(chatJID, "@newsletter") {
-		return false
+		return true
 	}
-	return true
+	return false
 }
 
 // slimMediaMessage guarda solo el sub-mensaje de media (menos RAM que clonar el mensaje completo).
