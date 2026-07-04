@@ -16,6 +16,8 @@ var (
 	clientLogLevel         string
 	sqliteBusyTimeoutMS    int
 	autoConnectStaggerSec  int
+	autoConnectDelaySec    int
+	shutdownWaitSec        int
 )
 
 func initRuntimeConfig() {
@@ -25,6 +27,8 @@ func initRuntimeConfig() {
 	verboseLogs = envBool("VERBOSE_LOGS", false)
 	sqliteBusyTimeoutMS = envInt("SQLITE_BUSY_TIMEOUT_MS", 15000)
 	autoConnectStaggerSec = envInt("AUTO_CONNECT_STAGGER_SEC", 3)
+	autoConnectDelaySec = envInt("AUTO_CONNECT_DELAY_SEC", 2)
+	shutdownWaitSec = envInt("SHUTDOWN_WAIT_SEC", 2)
 	clientLogLevel = strings.TrimSpace(strings.ToUpper(os.Getenv("CLIENT_LOG_LEVEL")))
 	if clientLogLevel == "" {
 		if verboseLogs {

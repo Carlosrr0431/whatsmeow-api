@@ -185,7 +185,10 @@ func main() {
 	}
 
 	go func() {
-		time.Sleep(2 * time.Second)
+		delay := time.Duration(autoConnectDelaySec) * time.Second
+		if delay > 0 {
+			time.Sleep(delay)
+		}
 		app.manager.AutoConnectAll()
 	}()
 
@@ -211,6 +214,10 @@ func main() {
 	<-c
 
 	fmt.Println("\nShutting down...")
+	app.manager.DisconnectAll()
+	if shutdownWaitSec > 0 {
+		time.Sleep(time.Duration(shutdownWaitSec) * time.Second)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	server.Shutdown(ctx)

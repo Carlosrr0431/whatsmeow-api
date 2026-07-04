@@ -68,14 +68,15 @@ type SessionManager struct {
 	defaultSecret string
 	registry      *SessionRegistry
 	sessions      map[string]*AgentSession
+	draining      bool
 	mu            sync.RWMutex
 	httpClient    *http.Client
 }
 
 func NewSessionManager(dataDir, defaultSecret string) (*SessionManager, error) {
 	initRuntimeConfig()
-	fmt.Printf("[CONFIG] max_msg_history=%d max_raw_media=%d skip_groups=%v client_log=%s sqlite_busy_ms=%d connect_stagger_sec=%d\n",
-		maxMsgHistLimit, maxRawMediaLimit, skipGroupsAndBroadcast, clientLogLevel, sqliteBusyTimeoutMS, autoConnectStaggerSec)
+	fmt.Printf("[CONFIG] max_msg_history=%d max_raw_media=%d skip_groups=%v client_log=%s sqlite_busy_ms=%d connect_stagger_sec=%d connect_delay_sec=%d shutdown_wait_sec=%d\n",
+		maxMsgHistLimit, maxRawMediaLimit, skipGroupsAndBroadcast, clientLogLevel, sqliteBusyTimeoutMS, autoConnectStaggerSec, autoConnectDelaySec, shutdownWaitSec)
 
 	if dataDir == "" {
 		dataDir = "/app/data"
@@ -335,6 +336,38 @@ func (sm *SessionManager) ListStatus() []SessionStatusInfo {
 	return result
 }
 
+func (sm *SessionManager) IsDraining() bool {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.draining
+}
+
+// DisconnectAll cierra los websockets de WhatsApp antes de apagar el proceso (SIGTERM en Railway).
+// Evita que el contenedor viejo y el nuevo compitan por la misma sesión.
+func (sm *SessionManager) DisconnectAll() {
+	sm.mu.Lock()
+	sm.draining = true
+	sessions := make([]*AgentSession, 0, len(sm.sessions))
+	for _, s := range sm.sessions {
+		sessions = append(sessions, s)
+	}
+	sm.mu.Unlock()
+
+	fmt.Println("[SESSIONS] Graceful shutdown: disconnecting WhatsApp clients...")
+	for _, s := range sessions {
+		s.mu.RLock()
+		connected := s.connected && s.client != nil
+		code := s.AgentCode
+		s.mu.RUnlock()
+		if !connected {
+			continue
+		}
+		fmt.Printf("[SESSIONS] Disconnecting %s...\n", code)
+		s.Disconnect()
+	}
+	fmt.Println("[SESSIONS] All WhatsApp clients disconnected")
+}
+
 func (sm *SessionManager) AutoConnectAll() {
 	sm.mu.RLock()
 	codes := make([]string, 0, len(sm.registry.Agents))
@@ -494,14 +527,18 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 		}
 		s.mu.Unlock()
 		fmt.Printf("✓ [%s] WhatsApp connected\n", s.AgentCode)
-		s.dispatchWebhook("session.status", map[string]string{"status": "connected"})
+		if s.manager == nil || !s.manager.IsDraining() {
+			s.dispatchWebhook("session.status", map[string]string{"status": "connected"})
+		}
 
 	case *events.Disconnected:
 		s.mu.Lock()
 		s.connected = false
 		s.mu.Unlock()
 		fmt.Printf("✗ [%s] WhatsApp disconnected\n", s.AgentCode)
-		s.dispatchWebhook("session.status", map[string]string{"status": "disconnected"})
+		if s.manager == nil || !s.manager.IsDraining() {
+			s.dispatchWebhook("session.status", map[string]string{"status": "disconnected"})
+		}
 
 	case *events.LoggedOut:
 		s.mu.Lock()
@@ -509,7 +546,9 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 		s.client = nil
 		s.mu.Unlock()
 		fmt.Printf("✗ [%s] WhatsApp logged out\n", s.AgentCode)
-		s.dispatchWebhook("session.status", map[string]string{"status": "logged_out"})
+		if s.manager == nil || !s.manager.IsDraining() {
+			s.dispatchWebhook("session.status", map[string]string{"status": "logged_out"})
+		}
 	}
 }
 
