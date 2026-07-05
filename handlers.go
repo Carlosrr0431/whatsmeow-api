@@ -452,6 +452,15 @@ func (app *App) handleDownloadMedia(w http.ResponseWriter, r *http.Request) {
 
 	raw, ok := s.getRawMedia(id)
 	if !ok {
+		if evt, found := s.getMessageByID(id); found {
+			if rebuilt := messageEventToProto(evt); rebuilt != nil {
+				raw = rebuilt
+				ok = true
+				fmt.Printf("[MEDIA][%s] id=%s fallback=message_history type=%s\n", code, id, evt.Type)
+			}
+		}
+	}
+	if !ok {
 		writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Message: "Media not found or expired from cache"})
 		return
 	}

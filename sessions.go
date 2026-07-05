@@ -20,6 +20,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
 )
 
 type AgentRegistryEntry struct {
@@ -949,7 +950,7 @@ func (s *AgentSession) messageFromEvent(info types.MessageInfo, message *waE2E.M
 	msg := MessageEvent{
 		ID:        info.ID,
 		From:      info.Sender.String(),
-		To:        info.Chat.String(),
+		To:        chatJID,
 		ChatJID:   chatJID,
 		SenderPN:  senderPN,
 		SenderLID: senderLID,
@@ -991,6 +992,92 @@ func (s *AgentSession) getRawMedia(id string) (*waE2E.Message, bool) {
 	defer s.mu.RUnlock()
 	msg, ok := s.rawMedia[id]
 	return msg, ok
+}
+
+func (s *AgentSession) getMessageByID(id string) (MessageEvent, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, msg := range s.messages {
+		if msg.ID == id {
+			return msg, true
+		}
+	}
+	return MessageEvent{}, false
+}
+
+func messageEventToProto(evt MessageEvent) *waE2E.Message {
+	if !evt.HasMedia || evt.MediaURL == "" {
+		return nil
+	}
+	mk, _ := base64.StdEncoding.DecodeString(evt.MediaKey)
+	fe, _ := base64.StdEncoding.DecodeString(evt.FileEncSHA256)
+	fs, _ := base64.StdEncoding.DecodeString(evt.FileSHA256)
+	msg := &waE2E.Message{}
+	switch evt.Type {
+	case "image":
+		msg.ImageMessage = &waE2E.ImageMessage{
+			URL:           proto.String(evt.MediaURL),
+			Mimetype:      proto.String(evt.Mimetype),
+			MediaKey:      mk,
+			DirectPath:    proto.String(evt.DirectPath),
+			FileEncSHA256: fe,
+			FileSHA256:    fs,
+			FileLength:    proto.Uint64(evt.FileLength),
+			Width:         proto.Uint32(evt.Width),
+			Height:        proto.Uint32(evt.Height),
+		}
+	case "video":
+		msg.VideoMessage = &waE2E.VideoMessage{
+			URL:           proto.String(evt.MediaURL),
+			Mimetype:      proto.String(evt.Mimetype),
+			MediaKey:      mk,
+			DirectPath:    proto.String(evt.DirectPath),
+			FileEncSHA256: fe,
+			FileSHA256:    fs,
+			FileLength:    proto.Uint64(evt.FileLength),
+			Width:         proto.Uint32(evt.Width),
+			Height:        proto.Uint32(evt.Height),
+			Seconds:       proto.Uint32(evt.Seconds),
+		}
+	case "sticker":
+		msg.StickerMessage = &waE2E.StickerMessage{
+			URL:           proto.String(evt.MediaURL),
+			Mimetype:      proto.String(evt.Mimetype),
+			MediaKey:      mk,
+			DirectPath:    proto.String(evt.DirectPath),
+			FileEncSHA256: fe,
+			FileSHA256:    fs,
+			FileLength:    proto.Uint64(evt.FileLength),
+			Width:         proto.Uint32(evt.Width),
+			Height:        proto.Uint32(evt.Height),
+		}
+	case "audio", "ptt":
+		msg.AudioMessage = &waE2E.AudioMessage{
+			URL:           proto.String(evt.MediaURL),
+			Mimetype:      proto.String(evt.Mimetype),
+			MediaKey:      mk,
+			DirectPath:    proto.String(evt.DirectPath),
+			FileEncSHA256: fe,
+			FileSHA256:    fs,
+			FileLength:    proto.Uint64(evt.FileLength),
+			Seconds:       proto.Uint32(evt.Seconds),
+			PTT:           proto.Bool(evt.Type == "ptt"),
+		}
+	case "document":
+		msg.DocumentMessage = &waE2E.DocumentMessage{
+			URL:           proto.String(evt.MediaURL),
+			Mimetype:      proto.String(evt.Mimetype),
+			MediaKey:      mk,
+			DirectPath:    proto.String(evt.DirectPath),
+			FileEncSHA256: fe,
+			FileSHA256:    fs,
+			FileLength:    proto.Uint64(evt.FileLength),
+			FileName:      proto.String(evt.FileName),
+		}
+	default:
+		return nil
+	}
+	return msg
 }
 
 func b64(data []byte) string {
