@@ -484,6 +484,12 @@ func (s *AgentSession) dispatchWebhook(event string, data interface{}) {
 		}
 		if event == "messages.upsert" {
 			fmt.Printf("[WEBHOOK] %s messages.upsert → OK\n", agentCode)
+		} else if event == "messages.status" {
+			if dataMap, ok := data.(map[string]interface{}); ok {
+				fmt.Printf("[WEBHOOK] %s messages.status id=%v status=%v → OK\n", agentCode, dataMap["id"], dataMap["status"])
+			} else {
+				fmt.Printf("[WEBHOOK] %s messages.status → OK\n", agentCode)
+			}
 		} else {
 			logVerbose("[WEBHOOK] %s %s → %s: %d\n", agentCode, event, url, resp.StatusCode)
 		}
