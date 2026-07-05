@@ -152,6 +152,7 @@ func main() {
 					"/api/session/connect",
 					"/api/session/qr?agent_code=AGENT",
 					"/api/webhook/config",
+					"/v2/message/sendButtons/{instance}",
 				},
 			},
 		})
@@ -170,6 +171,7 @@ func main() {
 	mux.HandleFunc("/api/messages/revoke", app.handleRevokeMessage)
 	mux.HandleFunc("/api/messages/edit", app.handleEditMessage)
 	mux.HandleFunc("/api/messages/reaction", app.handleSendReaction)
+	mux.HandleFunc("/v2/message/sendButtons/", app.handleV2SendButtons)
 	mux.HandleFunc("/api/contacts", app.handleGetContacts)
 	mux.HandleFunc("/api/groups", app.handleGetGroups)
 	mux.HandleFunc("/api/check-number", app.handleCheckNumber)
