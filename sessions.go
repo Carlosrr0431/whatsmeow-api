@@ -56,6 +56,9 @@ type AgentSession struct {
 	rawOrder  []string
 	undecryptableSeen map[string]struct{}
 	undecryptableOrder []string
+	statusNotifyMu     sync.Mutex
+	disconnectTimer    *time.Timer
+	disconnectNotified bool
 	mu        sync.RWMutex
 
 	manager    *SessionManager
@@ -75,8 +78,8 @@ type SessionManager struct {
 
 func NewSessionManager(dataDir, defaultSecret string) (*SessionManager, error) {
 	initRuntimeConfig()
-	fmt.Printf("[CONFIG] max_msg_history=%d max_raw_media=%d skip_groups=%v client_log=%s sqlite_busy_ms=%d connect_stagger_sec=%d connect_delay_sec=%d shutdown_wait_sec=%d\n",
-		maxMsgHistLimit, maxRawMediaLimit, skipGroupsAndBroadcast, clientLogLevel, sqliteBusyTimeoutMS, autoConnectStaggerSec, autoConnectDelaySec, shutdownWaitSec)
+	fmt.Printf("[CONFIG] max_msg_history=%d max_raw_media=%d skip_groups=%v client_log=%s sqlite_busy_ms=%d connect_stagger_sec=%d connect_delay_sec=%d shutdown_wait_sec=%d status_debounce_sec=%d\n",
+		maxMsgHistLimit, maxRawMediaLimit, skipGroupsAndBroadcast, clientLogLevel, sqliteBusyTimeoutMS, autoConnectStaggerSec, autoConnectDelaySec, shutdownWaitSec, sessionStatusDebounceSec)
 
 	if dataDir == "" {
 		dataDir = "/app/data"
@@ -207,7 +210,7 @@ func (sm *SessionManager) sqliteDSN(agentCode string) string {
 }
 
 func newClientLogger(agentCode string) waLog.Logger {
-	return waLog.Stdout("Client-"+safeAgentDir(agentCode), clientLogLevel, true)
+	return newFilteredClientLogger(agentCode)
 }
 
 func configureWhatsAppClient(client *whatsmeow.Client) {
@@ -520,27 +523,13 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 		s.handleReceipt(v)
 
 	case *events.Connected:
-		s.mu.Lock()
-		s.connected = true
-		if s.client != nil {
-			s.client.AutoReconnectErrors = 0
-		}
-		s.mu.Unlock()
-		fmt.Printf("✓ [%s] WhatsApp connected\n", s.AgentCode)
-		if s.manager == nil || !s.manager.IsDraining() {
-			s.dispatchWebhook("session.status", map[string]string{"status": "connected"})
-		}
+		s.handleConnected()
 
 	case *events.Disconnected:
-		s.mu.Lock()
-		s.connected = false
-		s.mu.Unlock()
-		fmt.Printf("✗ [%s] WhatsApp disconnected\n", s.AgentCode)
-		if s.manager == nil || !s.manager.IsDraining() {
-			s.dispatchWebhook("session.status", map[string]string{"status": "disconnected"})
-		}
+		s.handleDisconnected()
 
 	case *events.LoggedOut:
+		s.cancelDisconnectNotify()
 		s.mu.Lock()
 		s.connected = false
 		s.client = nil
@@ -549,6 +538,106 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 		if s.manager == nil || !s.manager.IsDraining() {
 			s.dispatchWebhook("session.status", map[string]string{"status": "logged_out"})
 		}
+	}
+}
+
+func (s *AgentSession) cancelDisconnectNotify() {
+	s.statusNotifyMu.Lock()
+	defer s.statusNotifyMu.Unlock()
+	if s.disconnectTimer != nil {
+		s.disconnectTimer.Stop()
+		s.disconnectTimer = nil
+	}
+}
+
+func (s *AgentSession) handleDisconnected() {
+	if s.manager != nil && s.manager.IsDraining() {
+		s.mu.Lock()
+		s.connected = false
+		s.mu.Unlock()
+		return
+	}
+
+	s.mu.Lock()
+	s.connected = false
+	s.mu.Unlock()
+
+	delay := time.Duration(sessionStatusDebounceSec) * time.Second
+	if delay <= 0 {
+		fmt.Printf("✗ [%s] WhatsApp disconnected\n", s.AgentCode)
+		s.dispatchWebhook("session.status", map[string]string{"status": "disconnected"})
+		s.statusNotifyMu.Lock()
+		s.disconnectNotified = true
+		s.statusNotifyMu.Unlock()
+		return
+	}
+
+	s.statusNotifyMu.Lock()
+	if s.disconnectTimer != nil {
+		s.disconnectTimer.Stop()
+	}
+	code := s.AgentCode
+	s.disconnectTimer = time.AfterFunc(delay, func() {
+		s.statusNotifyMu.Lock()
+		s.disconnectTimer = nil
+		s.statusNotifyMu.Unlock()
+
+		s.mu.RLock()
+		stillDown := !s.connected
+		s.mu.RUnlock()
+		if !stillDown {
+			return
+		}
+
+		fmt.Printf("✗ [%s] WhatsApp disconnected (sin reconexión tras %ds)\n", code, sessionStatusDebounceSec)
+		s.statusNotifyMu.Lock()
+		s.disconnectNotified = true
+		s.statusNotifyMu.Unlock()
+		if s.manager == nil || !s.manager.IsDraining() {
+			s.dispatchWebhook("session.status", map[string]string{"status": "disconnected"})
+		}
+	})
+	s.statusNotifyMu.Unlock()
+
+	logVerbose("↻ [%s] corte de websocket (reconexión automática en curso)\n", s.AgentCode)
+}
+
+func (s *AgentSession) handleConnected() {
+	s.statusNotifyMu.Lock()
+	notified := s.disconnectNotified
+	hadPendingTimer := s.disconnectTimer != nil
+	if s.disconnectTimer != nil {
+		s.disconnectTimer.Stop()
+		s.disconnectTimer = nil
+	}
+	s.statusNotifyMu.Unlock()
+
+	s.mu.Lock()
+	s.connected = true
+	if s.client != nil {
+		s.client.AutoReconnectErrors = 0
+	}
+	s.mu.Unlock()
+
+	if notified {
+		fmt.Printf("✓ [%s] WhatsApp connected\n", s.AgentCode)
+		s.statusNotifyMu.Lock()
+		s.disconnectNotified = false
+		s.statusNotifyMu.Unlock()
+		if s.manager == nil || !s.manager.IsDraining() {
+			s.dispatchWebhook("session.status", map[string]string{"status": "connected"})
+		}
+		return
+	}
+
+	if hadPendingTimer {
+		logVerbose("✓ [%s] reconectado tras corte breve de red\n", s.AgentCode)
+		return
+	}
+
+	fmt.Printf("✓ [%s] WhatsApp connected\n", s.AgentCode)
+	if s.manager == nil || !s.manager.IsDraining() {
+		s.dispatchWebhook("session.status", map[string]string{"status": "connected"})
 	}
 }
 
@@ -668,6 +757,7 @@ func (s *AgentSession) GetQR() string {
 }
 
 func (s *AgentSession) Disconnect() {
+	s.cancelDisconnectNotify()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.client != nil {

@@ -18,6 +18,7 @@ var (
 	autoConnectStaggerSec  int
 	autoConnectDelaySec    int
 	shutdownWaitSec        int
+	sessionStatusDebounceSec int
 )
 
 func initRuntimeConfig() {
@@ -29,6 +30,7 @@ func initRuntimeConfig() {
 	autoConnectStaggerSec = envInt("AUTO_CONNECT_STAGGER_SEC", 3)
 	autoConnectDelaySec = envInt("AUTO_CONNECT_DELAY_SEC", 2)
 	shutdownWaitSec = envInt("SHUTDOWN_WAIT_SEC", 2)
+	sessionStatusDebounceSec = envInt("SESSION_STATUS_DEBOUNCE_SEC", 15)
 	clientLogLevel = strings.TrimSpace(strings.ToUpper(os.Getenv("CLIENT_LOG_LEVEL")))
 	if clientLogLevel == "" {
 		if verboseLogs {

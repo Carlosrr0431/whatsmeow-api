@@ -28,6 +28,7 @@ Variables opcionales para reducir memoria, CPU y egress:
 | `CLIENT_LOG_LEVEL` | `ERROR` (o `WARN` si `VERBOSE_LOGS=true`) | Nivel de logs internos de whatsmeow por sesión |
 | `SQLITE_BUSY_TIMEOUT_MS` | `15000` | Espera ante `database is locked` (multi-sesión en un solo volumen) |
 | `AUTO_CONNECT_STAGGER_SEC` | `3` | Segundos entre reconexiones al arrancar (evita picos de SQLite) |
+| `SESSION_STATUS_DEBOUNCE_SEC` | `15` | Espera antes de avisar `disconnected` al CRM (ignora cortes EOF breves) |
 | `GOGC` | `80` | GC más frecuente → menos picos de RAM |
 
 **Ya no uses** `AGENT_CODE` ni `WEBHOOK_URL` fijos. Cada agente se registra vía `POST /api/webhook/config` con su `agent_code` y `webhook_url` (lo hace el dashboard al guardar el agente).
@@ -106,7 +107,9 @@ Servidor en `http://localhost:8080`.
 
 | Log | Significado |
 |-----|-------------|
-| `Error reading from websocket ... EOF` | Corte de red con WhatsApp; whatsmeow reconecta solo (`✓ connected` después) |
+| `Error reading from websocket ... EOF` | Corte de red con WhatsApp; whatsmeow reconecta solo en segundos. Con `SESSION_STATUS_DEBOUNCE_SEC` no se avisa al CRM ni se loguea como ERROR salvo que dure >15s |
+| `↻ corte de websocket (reconexión automática)` | Solo con `VERBOSE_LOGS=true`; reconexión en curso |
+| `✓ reconectado tras corte breve de red` | Solo con `VERBOSE_LOGS=true`; reconexión exitosa sin avisar al CRM |
 | `Got 503 stream error, assuming automatic reconnect` | WhatsApp cerró el stream; reconexión automática |
 | `✗ disconnected` → `✓ connected` | Ciclo de reconexión exitoso |
 | `Error decrypting ... @g.us` / `status@broadcast` / `@newsletter` | Grupos, estados o newsletters con `SKIP_GROUPS=true` (no van al CRM) |
