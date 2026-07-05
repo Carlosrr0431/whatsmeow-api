@@ -477,8 +477,16 @@ func (s *AgentSession) dispatchWebhook(event string, data interface{}) {
 			return
 		}
 		defer resp.Body.Close()
-		_, _ = io.Copy(io.Discard, resp.Body)
-		logVerbose("[WEBHOOK] %s %s → %s: %d\n", agentCode, event, url, resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			fmt.Printf("[WEBHOOK] %s %s → %s: HTTP %d %s\n", agentCode, event, url, resp.StatusCode, strings.TrimSpace(string(body)))
+			return
+		}
+		if event == "messages.upsert" {
+			fmt.Printf("[WEBHOOK] %s messages.upsert → OK\n", agentCode)
+		} else {
+			logVerbose("[WEBHOOK] %s %s → %s: %d\n", agentCode, event, url, resp.StatusCode)
+		}
 	}()
 }
 
