@@ -265,6 +265,57 @@ func (app *App) handleSendImage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "Invalid request body"})
 		return
 	}
+	app.sendMediaInternal(w, r, mediaSendRequest{
+		AgentCode: req.AgentCode,
+		Phone:     req.Phone,
+		Media:     req.Image,
+		Caption:   req.Caption,
+		Type:      "image",
+		Mimetype:  "image/jpeg",
+	})
+}
+
+type mediaSendRequest struct {
+	AgentCode string
+	Phone     string
+	Media     string
+	Caption   string
+	Type      string
+	Mimetype  string
+	Filename  string
+}
+
+func (app *App) handleSendMedia(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AgentCode string `json:"agent_code"`
+		Phone     string `json:"phone"`
+		Media     string `json:"media"`
+		Image     string `json:"image"` // alias compat send-image
+		Caption   string `json:"caption"`
+		Type      string `json:"type"`
+		Mimetype  string `json:"mimetype"`
+		Filename  string `json:"filename"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "Invalid request body"})
+		return
+	}
+	media := req.Media
+	if media == "" {
+		media = req.Image
+	}
+	app.sendMediaInternal(w, r, mediaSendRequest{
+		AgentCode: req.AgentCode,
+		Phone:     req.Phone,
+		Media:     media,
+		Caption:   req.Caption,
+		Type:      req.Type,
+		Mimetype:  req.Mimetype,
+		Filename:  req.Filename,
+	})
+}
+
+func (app *App) sendMediaInternal(w http.ResponseWriter, r *http.Request, req mediaSendRequest) {
 	s, ok := app.sessionFromRequest(w, r, req.AgentCode)
 	if !ok {
 		return
@@ -274,42 +325,144 @@ func (app *App) handleSendImage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WhatsApp not connected for this agent"})
 		return
 	}
-
-	imageData, err := base64.StdEncoding.DecodeString(req.Image)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "Invalid base64 image"})
+	if req.Phone == "" || req.Media == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "phone and media are required"})
 		return
 	}
 
-	uploaded, err := client.Upload(context.Background(), imageData, whatsmeow.MediaImage)
+	mediaType := strings.ToLower(strings.TrimSpace(req.Type))
+	mime := strings.TrimSpace(req.Mimetype)
+	if mediaType == "" {
+		switch {
+		case strings.HasPrefix(mime, "image/"):
+			mediaType = "image"
+		case strings.HasPrefix(mime, "video/"):
+			mediaType = "video"
+		case strings.HasPrefix(mime, "audio/"):
+			mediaType = "audio"
+		default:
+			mediaType = "document"
+		}
+	}
+
+	data, err := base64.StdEncoding.DecodeString(req.Media)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "Invalid base64 media"})
+		return
+	}
+
+	var uploadType whatsmeow.MediaType
+	switch mediaType {
+	case "image":
+		uploadType = whatsmeow.MediaImage
+		if mime == "" {
+			mime = "image/jpeg"
+		}
+	case "video":
+		uploadType = whatsmeow.MediaVideo
+		if mime == "" {
+			mime = "video/mp4"
+		}
+	case "audio":
+		uploadType = whatsmeow.MediaAudio
+		if mime == "" {
+			mime = "audio/ogg; codecs=opus"
+		}
+	default:
+		mediaType = "document"
+		uploadType = whatsmeow.MediaDocument
+		if mime == "" {
+			mime = "application/octet-stream"
+		}
+	}
+
+	uploaded, err := client.Upload(context.Background(), data, uploadType)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
 		return
 	}
 
 	jid := parseJID(req.Phone)
-	msg := &waE2E.Message{
-		ImageMessage: &waE2E.ImageMessage{
-			Caption:       proto.String(req.Caption),
-			URL:           proto.String(uploaded.URL),
-			DirectPath:    proto.String(uploaded.DirectPath),
-			MediaKey:      uploaded.MediaKey,
-			Mimetype:      proto.String("image/jpeg"),
-			FileEncSHA256: uploaded.FileEncSHA256,
-			FileSHA256:    uploaded.FileSHA256,
-			FileLength:    proto.Uint64(uint64(len(imageData))),
-		},
+	var msg *waE2E.Message
+	switch mediaType {
+	case "image":
+		msg = &waE2E.Message{
+			ImageMessage: &waE2E.ImageMessage{
+				Caption:       proto.String(req.Caption),
+				URL:           proto.String(uploaded.URL),
+				DirectPath:    proto.String(uploaded.DirectPath),
+				MediaKey:      uploaded.MediaKey,
+				Mimetype:      proto.String(mime),
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:    uploaded.FileSHA256,
+				FileLength:    proto.Uint64(uint64(len(data))),
+			},
+		}
+	case "video":
+		msg = &waE2E.Message{
+			VideoMessage: &waE2E.VideoMessage{
+				Caption:       proto.String(req.Caption),
+				URL:           proto.String(uploaded.URL),
+				DirectPath:    proto.String(uploaded.DirectPath),
+				MediaKey:      uploaded.MediaKey,
+				Mimetype:      proto.String(mime),
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:    uploaded.FileSHA256,
+				FileLength:    proto.Uint64(uint64(len(data))),
+			},
+		}
+	case "audio":
+		msg = &waE2E.Message{
+			AudioMessage: &waE2E.AudioMessage{
+				URL:           proto.String(uploaded.URL),
+				DirectPath:    proto.String(uploaded.DirectPath),
+				MediaKey:      uploaded.MediaKey,
+				Mimetype:      proto.String(mime),
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:    uploaded.FileSHA256,
+				FileLength:    proto.Uint64(uint64(len(data))),
+			},
+		}
+	default:
+		fileName := req.Filename
+		if fileName == "" {
+			fileName = "archivo"
+		}
+		msg = &waE2E.Message{
+			DocumentMessage: &waE2E.DocumentMessage{
+				Caption:       proto.String(req.Caption),
+				Title:         proto.String(fileName),
+				FileName:      proto.String(fileName),
+				URL:           proto.String(uploaded.URL),
+				DirectPath:    proto.String(uploaded.DirectPath),
+				MediaKey:      uploaded.MediaKey,
+				Mimetype:      proto.String(mime),
+				FileEncSHA256: uploaded.FileEncSHA256,
+				FileSHA256:    uploaded.FileSHA256,
+				FileLength:    proto.Uint64(uint64(len(data))),
+			},
+		}
 	}
+
 	resp, err := client.SendMessage(context.Background(), jid, msg)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
 		return
 	}
-	s.storeSentMessage(resp.ID, jid.String(), req.Caption, "image", resp.Timestamp.Unix())
+
+	body := req.Caption
+	if body == "" {
+		body = req.Filename
+	}
+	s.storeSentMessage(resp.ID, jid.String(), body, mediaType, resp.Timestamp.Unix())
 	writeJSON(w, http.StatusOK, APIResponse{
 		Success: true,
-		Message: "Image sent",
-		Data:    map[string]interface{}{"message_id": resp.ID, "timestamp": resp.Timestamp.Unix()},
+		Message: "Media sent",
+		Data: map[string]interface{}{
+			"message_id": resp.ID,
+			"timestamp":  resp.Timestamp.Unix(),
+			"type":       mediaType,
+		},
 	})
 }
 

@@ -401,6 +401,10 @@ func (sm *SessionManager) AutoConnectAll() {
 	}
 }
 
+func (s *AgentSession) isLoggedInLocked() bool {
+	return s.client != nil && s.client.Store != nil && s.client.Store.ID != nil
+}
+
 func (s *AgentSession) StatusInfo() SessionStatusInfo {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -411,27 +415,27 @@ func (s *AgentSession) StatusInfo() SessionStatusInfo {
 		Status:     "disconnected",
 	}
 
-	if s.client != nil {
-		if s.client.Store.ID != nil {
-			info.HasSession = true
-		}
-		if s.connected {
-			info.Connected = true
-			info.Status = "connected"
-			if s.client.Store.ID != nil {
-				info.Phone = s.client.Store.ID.User
-			}
-		} else if s.qrCode != "" {
-			info.Status = "need_scan"
-		} else if info.HasSession {
-			info.Status = "connecting"
-		} else {
-			info.Status = "logged_out"
-		}
+	loggedIn := s.isLoggedInLocked()
+	if loggedIn {
+		info.HasSession = true
+		info.Phone = s.client.Store.ID.User
+	}
+
+	// connected=true sin Store.ID = websocket esperando QR (NO es sesión usable)
+	if loggedIn && s.connected {
+		info.Connected = true
+		info.Status = "connected"
+	} else if s.client != nil && s.qrCode != "" {
+		info.Status = "need_scan"
+	} else if loggedIn {
+		info.Status = "connecting"
+	} else if s.client != nil {
+		info.Status = "need_scan"
 	} else {
 		deviceStore, err := s.container.GetFirstDevice(context.Background())
 		if err == nil && deviceStore.ID != nil {
 			info.HasSession = true
+			info.Phone = deviceStore.ID.User
 			info.Status = "disconnected"
 		} else {
 			info.Status = "logged_out"
@@ -540,6 +544,25 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 	case *events.Connected:
 		s.handleConnected()
 
+	case *events.PairSuccess:
+		// Pairing nuevo: Store.ID ya existe. No toca sesiones ajenas.
+		s.mu.Lock()
+		s.qrCode = ""
+		phone := v.ID.User
+		if s.isLoggedInLocked() {
+			s.connected = true
+			phone = s.client.Store.ID.User
+		}
+		s.mu.Unlock()
+		fmt.Printf("✓ [%s] PairSuccess (%s)\n", s.AgentCode, phone)
+		payload := map[string]string{"status": "connected"}
+		if phone != "" {
+			payload["phone"] = phone
+		}
+		if s.manager == nil || !s.manager.IsDraining() {
+			s.dispatchWebhook("session.status", payload)
+		}
+
 	case *events.Disconnected:
 		s.handleDisconnected()
 
@@ -548,6 +571,7 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 		s.mu.Lock()
 		s.connected = false
 		s.client = nil
+		s.qrCode = ""
 		s.mu.Unlock()
 		fmt.Printf("✗ [%s] WhatsApp logged out\n", s.AgentCode)
 		if s.manager == nil || !s.manager.IsDraining() {
@@ -628,19 +652,30 @@ func (s *AgentSession) handleConnected() {
 	s.statusNotifyMu.Unlock()
 
 	s.mu.Lock()
+	// Connected del websocket puede llegar ANTES del login/QR.
+	// Sin Store.ID no hay sesión usable (SendMessage → ErrNotLoggedIn).
+	// NO hace Disconnect/Logout: solo evita marcar connected=true a sesiones sin device.
+	if !s.isLoggedInLocked() {
+		s.connected = false
+		s.mu.Unlock()
+		fmt.Printf("… [%s] WebSocket up, esperando login/QR\n", s.AgentCode)
+		return
+	}
 	s.connected = true
+	s.qrCode = ""
+	phone := s.client.Store.ID.User
 	if s.client != nil {
 		s.client.AutoReconnectErrors = 0
 	}
 	s.mu.Unlock()
 
 	if notified {
-		fmt.Printf("✓ [%s] WhatsApp connected\n", s.AgentCode)
+		fmt.Printf("✓ [%s] WhatsApp connected (%s)\n", s.AgentCode, phone)
 		s.statusNotifyMu.Lock()
 		s.disconnectNotified = false
 		s.statusNotifyMu.Unlock()
 		if s.manager == nil || !s.manager.IsDraining() {
-			s.dispatchWebhook("session.status", map[string]string{"status": "connected"})
+			s.dispatchWebhook("session.status", map[string]string{"status": "connected", "phone": phone})
 		}
 		return
 	}
@@ -650,9 +685,9 @@ func (s *AgentSession) handleConnected() {
 		return
 	}
 
-	fmt.Printf("✓ [%s] WhatsApp connected\n", s.AgentCode)
+	fmt.Printf("✓ [%s] WhatsApp connected (%s)\n", s.AgentCode, phone)
 	if s.manager == nil || !s.manager.IsDraining() {
-		s.dispatchWebhook("session.status", map[string]string{"status": "connected"})
+		s.dispatchWebhook("session.status", map[string]string{"status": "connected", "phone": phone})
 	}
 }
 
@@ -747,13 +782,22 @@ func (s *AgentSession) Connect() (needsQR bool, err error) {
 
 		go func() {
 			for evt := range qrChan {
+				qrPayload := ""
 				s.mu.Lock()
 				if evt.Event == "code" {
 					s.qrCode = evt.Code
+					qrPayload = evt.Code
 				} else {
 					s.qrCode = ""
 				}
 				s.mu.Unlock()
+				// Notifica al CRM vía webhook (sin polling de /api/session/qr)
+				if qrPayload != "" {
+					s.dispatchWebhook("session.status", map[string]string{
+						"status":  "need_scan",
+						"qr_code": qrPayload,
+					})
+				}
 			}
 		}()
 		s.mu.Unlock()
@@ -796,7 +840,7 @@ func (s *AgentSession) Logout(ctx context.Context) error {
 func (s *AgentSession) Client() (*whatsmeow.Client, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if !s.connected || s.client == nil {
+	if !s.connected || !s.isLoggedInLocked() {
 		return nil, false
 	}
 	return s.client, true

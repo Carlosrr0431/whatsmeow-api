@@ -165,6 +165,7 @@ func main() {
 	mux.HandleFunc("/api/session/logout", app.handleLogout)
 	mux.HandleFunc("/api/messages/send", app.handleSendMessage)
 	mux.HandleFunc("/api/messages/send-image", app.handleSendImage)
+	mux.HandleFunc("/api/messages/send-media", app.handleSendMedia)
 	mux.HandleFunc("/api/messages/send-group", app.handleSendGroupMessage)
 	mux.HandleFunc("/api/messages/history", app.handleGetMessages)
 	mux.HandleFunc("/api/messages/media/", app.handleDownloadMedia)
