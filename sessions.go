@@ -1236,7 +1236,73 @@ func extractMessageContent(msg *waE2E.Message, evt *MessageEvent) {
 		if key := rm.GetKey(); key != nil {
 			evt.ReactionTargetID = key.GetID()
 		}
+	case msg.GetButtonsResponseMessage() != nil:
+		br := msg.GetButtonsResponseMessage()
+		evt.Type = "button_reply"
+		evt.Body = br.GetSelectedDisplayText()
+		evt.ButtonID = br.GetSelectedButtonID()
+		if evt.Body == "" {
+			evt.Body = evt.ButtonID
+		}
+	case msg.GetTemplateButtonReplyMessage() != nil:
+		tr := msg.GetTemplateButtonReplyMessage()
+		evt.Type = "button_reply"
+		evt.Body = tr.GetSelectedDisplayText()
+		evt.ButtonID = tr.GetSelectedID()
+		if evt.Body == "" {
+			evt.Body = evt.ButtonID
+		}
+	case msg.GetListResponseMessage() != nil:
+		lr := msg.GetListResponseMessage()
+		evt.Type = "button_reply"
+		evt.Body = lr.GetTitle()
+		if single := lr.GetSingleSelectReply(); single != nil {
+			evt.ButtonID = single.GetSelectedRowID()
+			if evt.Body == "" {
+				evt.Body = evt.ButtonID
+			}
+		}
+	case msg.GetInteractiveResponseMessage() != nil:
+		ir := msg.GetInteractiveResponseMessage()
+		evt.Type = "button_reply"
+		if nf := ir.GetNativeFlowResponseMessage(); nf != nil {
+			// paramsJSON suele ser {"id":"opt_1","display_text":"..."} o similar
+			params := strings.TrimSpace(nf.GetParamsJSON())
+			evt.Body = params
+			if id := extractJSONStringField(params, "id"); id != "" {
+				evt.ButtonID = id
+			}
+			if display := extractJSONStringField(params, "display_text"); display != "" {
+				evt.Body = display
+			} else if display := extractJSONStringField(params, "displayText"); display != "" {
+				evt.Body = display
+			}
+			if evt.Body == "" && evt.ButtonID != "" {
+				evt.Body = evt.ButtonID
+			}
+		}
+		if evt.Body == "" {
+			evt.Body = "button_reply"
+		}
 	}
+}
+
+// extractJSONStringField lee un campo string de un JSON plano sin dependencias extra.
+func extractJSONStringField(raw, key string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || key == "" {
+		return ""
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return ""
+	}
+	if v, ok := m[key]; ok {
+		if s, ok := v.(string); ok {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
 }
 
 func extractTextFromMessage(msg *waE2E.Message) string {

@@ -42,6 +42,7 @@ type MessageEvent struct {
 	HasMedia           bool   `json:"has_media,omitempty"`
 	ReactionTargetID   string `json:"reaction_target_id,omitempty"`
 	IsAnimatedSticker  bool   `json:"is_animated_sticker,omitempty"`
+	ButtonID           string `json:"button_id,omitempty"`
 }
 
 type APIResponse struct {
