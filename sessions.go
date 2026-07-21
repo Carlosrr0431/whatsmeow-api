@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -539,8 +540,10 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 			s.storeRawMedia(msg.ID, v.Message)
 		}
 		s.appendMessage(msg)
-		// Respuestas a botones / listas / interactive → evento dedicado
+		// Respuestas a botones: upsert (pipeline CRM) + evento dedicado
 		if msg.Type == "button_reply" {
+			fmt.Printf("[BUTTON_REPLY][%s] id=%s button_id=%q body=%q\n", s.AgentCode, msg.ID, msg.ButtonID, msg.Body)
+			s.dispatchWebhook("messages.upsert", msg)
 			s.dispatchWebhook("messages.button", msg)
 		} else {
 			s.dispatchWebhook("messages.upsert", msg)
@@ -1250,25 +1253,25 @@ func extractMessageContent(msg *waE2E.Message, evt *MessageEvent) {
 	case msg.GetButtonsResponseMessage() != nil:
 		br := msg.GetButtonsResponseMessage()
 		evt.Type = "button_reply"
-		evt.Body = br.GetSelectedDisplayText()
-		evt.ButtonID = br.GetSelectedButtonID()
+		evt.Body = strings.TrimSpace(br.GetSelectedDisplayText())
+		evt.ButtonID = strings.TrimSpace(br.GetSelectedButtonID())
 		if evt.Body == "" {
 			evt.Body = evt.ButtonID
 		}
 	case msg.GetTemplateButtonReplyMessage() != nil:
 		tr := msg.GetTemplateButtonReplyMessage()
 		evt.Type = "button_reply"
-		evt.Body = tr.GetSelectedDisplayText()
-		evt.ButtonID = tr.GetSelectedID()
+		evt.Body = strings.TrimSpace(tr.GetSelectedDisplayText())
+		evt.ButtonID = strings.TrimSpace(tr.GetSelectedID())
 		if evt.Body == "" {
 			evt.Body = evt.ButtonID
 		}
 	case msg.GetListResponseMessage() != nil:
 		lr := msg.GetListResponseMessage()
 		evt.Type = "button_reply"
-		evt.Body = lr.GetTitle()
+		evt.Body = strings.TrimSpace(lr.GetTitle())
 		if single := lr.GetSingleSelectReply(); single != nil {
-			evt.ButtonID = single.GetSelectedRowID()
+			evt.ButtonID = strings.TrimSpace(single.GetSelectedRowID())
 			if evt.Body == "" {
 				evt.Body = evt.ButtonID
 			}
@@ -1276,21 +1279,36 @@ func extractMessageContent(msg *waE2E.Message, evt *MessageEvent) {
 	case msg.GetInteractiveResponseMessage() != nil:
 		ir := msg.GetInteractiveResponseMessage()
 		evt.Type = "button_reply"
+		if body := ir.GetBody(); body != nil {
+			if t := strings.TrimSpace(body.GetText()); t != "" {
+				evt.Body = t
+			}
+		}
 		if nf := ir.GetNativeFlowResponseMessage(); nf != nil {
-			// paramsJSON suele ser {"id":"opt_1","display_text":"..."} o similar
 			params := strings.TrimSpace(nf.GetParamsJSON())
-			evt.Body = params
-			if id := extractJSONStringField(params, "id"); id != "" {
+			if id := extractButtonIDFromParams(params); id != "" {
 				evt.ButtonID = id
 			}
-			if display := extractJSONStringField(params, "display_text"); display != "" {
-				evt.Body = display
-			} else if display := extractJSONStringField(params, "displayText"); display != "" {
+			if display := extractButtonDisplayFromParams(params); display != "" {
 				evt.Body = display
 			}
-			if evt.Body == "" && evt.ButtonID != "" {
-				evt.Body = evt.ButtonID
+			// Si params_json viene anidado (string JSON dentro de JSON)
+			if evt.ButtonID == "" {
+				if nested := extractJSONStringField(params, "params_json"); nested != "" {
+					if id := extractButtonIDFromParams(nested); id != "" {
+						evt.ButtonID = id
+					}
+					if display := extractButtonDisplayFromParams(nested); display != "" {
+						evt.Body = display
+					}
+				}
 			}
+			if evt.Body == "" && nf.GetName() != "" && evt.ButtonID == "" {
+				evt.Body = strings.TrimSpace(nf.GetName())
+			}
+		}
+		if evt.Body == "" && evt.ButtonID != "" {
+			evt.Body = evt.ButtonID
 		}
 		if evt.Body == "" {
 			evt.Body = "button_reply"
@@ -1298,7 +1316,25 @@ func extractMessageContent(msg *waE2E.Message, evt *MessageEvent) {
 	}
 }
 
-// extractJSONStringField lee un campo string de un JSON plano sin dependencias extra.
+func extractButtonIDFromParams(params string) string {
+	for _, key := range []string{"id", "button_id", "selectedId", "selected_id", "row_id"} {
+		if id := extractJSONStringField(params, key); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+func extractButtonDisplayFromParams(params string) string {
+	for _, key := range []string{"display_text", "displayText", "title", "text", "selectedDisplayText"} {
+		if t := extractJSONStringField(params, key); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+// extractJSONStringField lee un campo string de un JSON plano (o JSON stringificado).
 func extractJSONStringField(raw, key string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" || key == "" {
@@ -1309,8 +1345,11 @@ func extractJSONStringField(raw, key string) string {
 		return ""
 	}
 	if v, ok := m[key]; ok {
-		if s, ok := v.(string); ok {
-			return strings.TrimSpace(s)
+		switch t := v.(type) {
+		case string:
+			return strings.TrimSpace(t)
+		case float64:
+			return strings.TrimSpace(strconv.FormatInt(int64(t), 10))
 		}
 	}
 	return ""
