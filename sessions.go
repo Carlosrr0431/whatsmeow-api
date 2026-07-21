@@ -489,6 +489,12 @@ func (s *AgentSession) dispatchWebhook(event string, data interface{}) {
 		}
 		if event == "messages.upsert" {
 			fmt.Printf("[WEBHOOK] %s messages.upsert → OK\n", agentCode)
+		} else if event == "messages.button" {
+			if msg, ok := data.(MessageEvent); ok {
+				fmt.Printf("[WEBHOOK] %s messages.button id=%s button_id=%s → OK\n", agentCode, msg.ID, msg.ButtonID)
+			} else {
+				fmt.Printf("[WEBHOOK] %s messages.button → OK\n", agentCode)
+			}
 		} else if event == "messages.status" {
 			if dataMap, ok := data.(map[string]interface{}); ok {
 				fmt.Printf("[WEBHOOK] %s messages.status id=%v status=%v → OK\n", agentCode, dataMap["id"], dataMap["status"])
@@ -533,7 +539,12 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 			s.storeRawMedia(msg.ID, v.Message)
 		}
 		s.appendMessage(msg)
-		s.dispatchWebhook("messages.upsert", msg)
+		// Respuestas a botones / listas / interactive → evento dedicado
+		if msg.Type == "button_reply" {
+			s.dispatchWebhook("messages.button", msg)
+		} else {
+			s.dispatchWebhook("messages.upsert", msg)
+		}
 
 	case *events.UndecryptableMessage:
 		s.handleUndecryptableMessage(v)

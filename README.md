@@ -43,6 +43,7 @@ Si tenías `AGENT_CODE` + `WEBHOOK_URL` en Railway y un `whatsapp.db` legacy en 
 - SQLite por agente: `/app/data/sessions/{agent_code}/whatsapp.db`
 - Al reiniciar, reconecta todas las sesiones registradas
 - Cada evento se envía al webhook configurado para ese `agent_code`
+- Eventos principales: `messages.upsert`, `messages.button` (respuestas a botones/listas), `messages.status`, `messages.reaction`, `messages.deleted`, `messages.edit`, `session.status`
 
 ## Endpoints
 
