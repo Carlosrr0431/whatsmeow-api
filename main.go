@@ -43,6 +43,8 @@ type MessageEvent struct {
 	ReactionTargetID   string `json:"reaction_target_id,omitempty"`
 	IsAnimatedSticker  bool   `json:"is_animated_sticker,omitempty"`
 	ButtonID           string `json:"button_id,omitempty"`
+	PollID             string `json:"poll_id,omitempty"`
+	PollOption         string `json:"poll_option,omitempty"`
 }
 
 type APIResponse struct {

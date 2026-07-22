@@ -1087,12 +1087,15 @@ func (s *AgentSession) handlePollVote(evt *events.Message) {
 
 	msg := s.messageFromEvent(evt.Info, evt.Message)
 	msg.Type = "button_reply"
+	msg.PollID = pollID
 	if selectedIdx >= 0 {
 		num := selectedIdx + 1
 		msg.ButtonID = fmt.Sprintf("opt_%d", num)
 		msg.Body = strconv.Itoa(num)
+		msg.PollOption = selectedText
 	} else if selectedText != "" {
 		msg.Body = selectedText
+		msg.PollOption = selectedText
 	} else {
 		// Sin opciones en memoria: no inventamos; logueamos para debug
 		fmt.Printf("[POLL_VOTE][%s] id=%s poll=%s — sin opciones guardadas (hashes=%d)\n",
