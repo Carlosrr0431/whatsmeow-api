@@ -403,8 +403,56 @@ func (sm *SessionManager) AutoConnectAll() {
 		}
 		fmt.Printf("[SESSIONS] Auto-connecting %s...\n", code)
 		go func(session *AgentSession) {
+			// Reintentos: tras redeploy el WS a veces falla al primer intento
+			var lastErr error
+			for attempt := 1; attempt <= 4; attempt++ {
+				if sm.IsDraining() {
+					return
+				}
+				lastErr = session.connectExisting()
+				if lastErr == nil {
+					return
+				}
+				fmt.Printf("[SESSIONS] Auto-connect %s attempt %d/4 failed: %v\n", session.AgentCode, attempt, lastErr)
+				time.Sleep(time.Duration(attempt*3) * time.Second)
+			}
+			fmt.Printf("[SESSIONS] Auto-connect %s gave up: %v\n", session.AgentCode, lastErr)
+		}(s)
+	}
+}
+
+// ReconnectDisconnected vuelve a conectar sesiones con device que no estén connected.
+// No toca pairing/QR ni hace logout.
+func (sm *SessionManager) ReconnectDisconnected() {
+	if sm.IsDraining() {
+		return
+	}
+	sm.mu.RLock()
+	codes := make([]string, 0, len(sm.registry.Agents))
+	for code := range sm.registry.Agents {
+		codes = append(codes, code)
+	}
+	sm.mu.RUnlock()
+
+	for _, code := range codes {
+		s, ok := sm.GetSession(code)
+		if !ok {
+			continue
+		}
+		s.mu.RLock()
+		already := s.connected && s.client != nil
+		s.mu.RUnlock()
+		if already {
+			continue
+		}
+		deviceStore, err := s.container.GetFirstDevice(context.Background())
+		if err != nil || deviceStore.ID == nil {
+			continue
+		}
+		fmt.Printf("[SESSIONS] ReconnectDisconnected %s...\n", code)
+		go func(session *AgentSession) {
 			if err := session.connectExisting(); err != nil {
-				fmt.Printf("[SESSIONS] Auto-connect %s failed: %v\n", session.AgentCode, err)
+				fmt.Printf("[SESSIONS] ReconnectDisconnected %s failed: %v\n", session.AgentCode, err)
 			}
 		}(s)
 	}
@@ -1061,8 +1109,10 @@ func (s *AgentSession) handlePollVote(evt *events.Message) {
 	}
 
 	s.appendMessage(msg)
+	// Compat CRM: upsert + button (opt_N) + evento dedicado poll
 	s.dispatchWebhook("messages.upsert", msg)
 	s.dispatchWebhook("messages.button", msg)
+	s.dispatchWebhook("messages.poll", msg)
 }
 
 func jidPhoneUser(jid types.JID) string {

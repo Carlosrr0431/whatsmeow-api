@@ -201,6 +201,12 @@ func main() {
 			time.Sleep(delay)
 		}
 		app.manager.AutoConnectAll()
+		// Segunda pasada: sesiones que fallaron el primer connect tras redeploy
+		time.Sleep(45 * time.Second)
+		if !app.manager.IsDraining() {
+			fmt.Println("[SESSIONS] Second-pass reconnect for any still-offline agents...")
+			app.manager.ReconnectDisconnected()
+		}
 	}()
 
 	server := &http.Server{
