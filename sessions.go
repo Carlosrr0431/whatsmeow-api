@@ -490,11 +490,11 @@ func (s *AgentSession) dispatchWebhook(event string, data interface{}) {
 		}
 		if event == "messages.upsert" {
 			fmt.Printf("[WEBHOOK] %s messages.upsert → OK\n", agentCode)
-		} else if event == "messages.button" {
+		} else if event == "messages.button" || event == "messages.list" {
 			if msg, ok := data.(MessageEvent); ok {
-				fmt.Printf("[WEBHOOK] %s messages.button id=%s button_id=%s → OK\n", agentCode, msg.ID, msg.ButtonID)
+				fmt.Printf("[WEBHOOK] %s %s id=%s button_id=%s → OK\n", agentCode, event, msg.ID, msg.ButtonID)
 			} else {
-				fmt.Printf("[WEBHOOK] %s messages.button → OK\n", agentCode)
+				fmt.Printf("[WEBHOOK] %s %s → OK\n", agentCode, event)
 			}
 		} else if event == "messages.status" {
 			if dataMap, ok := data.(map[string]interface{}); ok {
@@ -540,10 +540,16 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 			s.storeRawMedia(msg.ID, v.Message)
 		}
 		s.appendMessage(msg)
-		// Respuestas a botones: upsert (pipeline CRM) + evento dedicado
+		// Respuestas a botones/listas: upsert (pipeline CRM) + eventos dedicados
 		if msg.Type == "button_reply" {
 			fmt.Printf("[BUTTON_REPLY][%s] id=%s button_id=%q body=%q\n", s.AgentCode, msg.ID, msg.ButtonID, msg.Body)
 			s.dispatchWebhook("messages.upsert", msg)
+			s.dispatchWebhook("messages.button", msg)
+		} else if msg.Type == "list_reply" {
+			fmt.Printf("[LIST_REPLY][%s] id=%s row_id=%q body=%q\n", s.AgentCode, msg.ID, msg.ButtonID, msg.Body)
+			s.dispatchWebhook("messages.upsert", msg)
+			s.dispatchWebhook("messages.list", msg)
+			// Compat: clientes/configs que solo escuchan messages.button
 			s.dispatchWebhook("messages.button", msg)
 		} else {
 			s.dispatchWebhook("messages.upsert", msg)
@@ -1268,7 +1274,7 @@ func extractMessageContent(msg *waE2E.Message, evt *MessageEvent) {
 		}
 	case msg.GetListResponseMessage() != nil:
 		lr := msg.GetListResponseMessage()
-		evt.Type = "button_reply"
+		evt.Type = "list_reply"
 		evt.Body = strings.TrimSpace(lr.GetTitle())
 		if single := lr.GetSingleSelectReply(); single != nil {
 			evt.ButtonID = strings.TrimSpace(single.GetSelectedRowID())

@@ -43,7 +43,7 @@ Si tenías `AGENT_CODE` + `WEBHOOK_URL` en Railway y un `whatsapp.db` legacy en 
 - SQLite por agente: `/app/data/sessions/{agent_code}/whatsapp.db`
 - Al reiniciar, reconecta todas las sesiones registradas
 - Cada evento se envía al webhook configurado para ese `agent_code`
-- Eventos principales: `messages.upsert`, `messages.button` (respuestas a botones/listas), `messages.status`, `messages.reaction`, `messages.deleted`, `messages.edit`, `session.status`
+- Eventos principales: `messages.upsert`, `messages.button` (botones), `messages.list` (lista sendList), `messages.status`, `messages.reaction`, `messages.deleted`, `messages.edit`, `session.status`
 
 ## Endpoints
 
@@ -61,6 +61,8 @@ Todos los endpoints de sesión/mensajes requieren `agent_code` (query param o JS
 | POST | `/api/session/logout` | Cerrar sesión |
 | POST | `/api/messages/send` | Enviar texto (body incluye `agent_code`) |
 | POST | `/api/messages/send-image` | Enviar imagen |
+| POST | `/v2/message/sendButtons/{agent_code}` | Botones reply (máx 3) |
+| POST | `/v2/message/sendList/{agent_code}` | Lista interactiva (máx 8 filas) |
 | GET | `/api/contacts?agent_code=X` | Contactos |
 | GET | `/api/groups?agent_code=X` | Grupos |
 | GET | `/api/check-number?agent_code=X&phone=...` | Verificar número |
