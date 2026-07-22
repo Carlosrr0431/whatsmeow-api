@@ -158,6 +158,7 @@ func main() {
 					"/api/webhook/config",
 					"/v2/message/sendButtons/{instance}",
 					"/v2/message/sendList/{instance}",
+					"/v2/message/sendPoll/{instance}",
 				},
 			},
 		})
@@ -179,6 +180,7 @@ func main() {
 	mux.HandleFunc("/api/messages/reaction", app.handleSendReaction)
 	mux.HandleFunc("/v2/message/sendButtons/", app.handleV2SendButtons)
 	mux.HandleFunc("/v2/message/sendList/", app.handleV2SendList)
+	mux.HandleFunc("/v2/message/sendPoll/", app.handleV2SendPoll)
 	mux.HandleFunc("/api/contacts", app.handleGetContacts)
 	mux.HandleFunc("/api/groups", app.handleGetGroups)
 	mux.HandleFunc("/api/check-number", app.handleCheckNumber)
