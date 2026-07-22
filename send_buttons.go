@@ -266,25 +266,29 @@ func buildButtonsMessage(req sendButtonsRequest) (*waE2E.Message, string, []waBi
 		templateID := strconv.FormatInt(time.Now().UnixMilli(), 10)
 		messageParamsJSON := `{"from":"api","templateId":` + templateID + `}`
 		msgVersion := int32(1)
-		// Sin DocumentWithCaption: ese wrapper hace que WA responda 405 en reply.
-		interactive := &waE2E.InteractiveMessage{
-			Body: &waE2E.InteractiveMessage_Body{Text: proto.String(body)},
-			Footer: &waE2E.InteractiveMessage_Footer{
-				Text: proto.String(req.Footer),
-			},
-			InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
-				NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
-					Buttons:           nativeButtons,
-					MessageParamsJSON: proto.String(messageParamsJSON),
-					MessageVersion:    proto.Int32(msgVersion),
+		// ViewOnceMessageV2Extension: formato que reportan como working para quick_reply.
+		interactive := &waE2E.Message{
+			InteractiveMessage: &waE2E.InteractiveMessage{
+				Body: &waE2E.InteractiveMessage_Body{Text: proto.String(body)},
+				Footer: &waE2E.InteractiveMessage_Footer{
+					Text: proto.String(req.Footer),
+				},
+				InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
+					NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
+						Buttons:           nativeButtons,
+						MessageParamsJSON: proto.String(messageParamsJSON),
+						MessageVersion:    proto.Int32(msgVersion),
+					},
 				},
 			},
-		}
-		msg = &waE2E.Message{
-			InteractiveMessage: interactive,
 			MessageContextInfo: ctxInfo,
 		}
-		msgType = "InteractiveMessage"
+		msg = &waE2E.Message{
+			ViewOnceMessageV2Extension: &waE2E.FutureProofMessage{
+				Message: interactive,
+			},
+		}
+		msgType = "InteractiveMessage_VO2Ext"
 		if hasReply && !hasOther {
 			bizNativeName = "quick_reply"
 		} else {
