@@ -107,6 +107,7 @@ func (app *App) handleV2SendPoll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.storeSentMessage(resp.ID, jid.String(), name, "PollCreation", resp.Timestamp.Unix())
+	s.storePollOptions(resp.ID, opts)
 	fmt.Printf("[POLL][%s] → %s id=%s options=%d\n", req.AgentCode, phone, resp.ID, len(opts))
 
 	writeJSON(w, http.StatusOK, APIResponse{

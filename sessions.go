@@ -56,15 +56,19 @@ type AgentSession struct {
 	messages  []MessageEvent
 	rawMedia  map[string]*waE2E.Message
 	rawOrder  []string
-	undecryptableSeen map[string]struct{}
+	// pollOptions: message_id del PollCreation → textos de opciones (para DecryptPollVote)
+	pollOptions        map[string][]string
+	pollOrder          []string
+	undecryptableSeen  map[string]struct{}
 	undecryptableOrder []string
 	statusNotifyMu     sync.Mutex
 	disconnectTimer    *time.Timer
 	disconnectNotified bool
-	mu        sync.RWMutex
+	mu                 sync.RWMutex
 
 	manager    *SessionManager
 	httpClient *http.Client
+	sessionDir string
 }
 
 type SessionManager struct {
@@ -245,18 +249,22 @@ func (sm *SessionManager) initSession(agentCode, webhookURL, webhookSecret strin
 	}
 
 	s := &AgentSession{
-		AgentCode:     agentCode,
-		WebhookURL:    webhookURL,
-		WebhookSecret: webhookSecret,
-		container:     container,
-		messages:      make([]MessageEvent, 0),
-		rawMedia:      make(map[string]*waE2E.Message),
-		rawOrder:      make([]string, 0),
-		undecryptableSeen: make(map[string]struct{}),
+		AgentCode:          agentCode,
+		WebhookURL:         webhookURL,
+		WebhookSecret:      webhookSecret,
+		container:          container,
+		messages:           make([]MessageEvent, 0),
+		rawMedia:           make(map[string]*waE2E.Message),
+		rawOrder:           make([]string, 0),
+		pollOptions:        make(map[string][]string),
+		pollOrder:          make([]string, 0),
+		undecryptableSeen:  make(map[string]struct{}),
 		undecryptableOrder: make([]string, 0),
-		manager:       sm,
-		httpClient:    sm.httpClient,
+		manager:            sm,
+		httpClient:         sm.httpClient,
+		sessionDir:         dbDir,
 	}
+	s.loadPollOptionsFromDisk()
 	sm.sessions[agentCode] = s
 	return s, nil
 }
@@ -531,6 +539,10 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 		}
 		if pm := v.Message.GetProtocolMessage(); pm != nil {
 			s.handleProtocolMessage(v.Info, pm)
+			return
+		}
+		if v.Message.GetPollUpdateMessage() != nil {
+			s.handlePollVote(v)
 			return
 		}
 		msg := s.messageFromEvent(v.Info, v.Message)
@@ -895,6 +907,162 @@ func (s *AgentSession) storeSentMessage(id, toJID, body, msgType string, timesta
 		PushName:  "Yo",
 	}
 	s.appendMessage(msg)
+}
+
+const maxPollOptionsStored = 200
+
+func (s *AgentSession) pollOptionsPath() string {
+	if s.sessionDir == "" {
+		return ""
+	}
+	return filepath.Join(s.sessionDir, "poll_options.json")
+}
+
+func (s *AgentSession) loadPollOptionsFromDisk() {
+	path := s.pollOptionsPath()
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var stored map[string][]string
+	if err := json.Unmarshal(data, &stored); err != nil || len(stored) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, opts := range stored {
+		if id == "" || len(opts) == 0 {
+			continue
+		}
+		s.pollOptions[id] = opts
+		s.pollOrder = append(s.pollOrder, id)
+	}
+	fmt.Printf("[POLL][%s] loaded %d poll option maps from disk\n", s.AgentCode, len(s.pollOptions))
+}
+
+func (s *AgentSession) persistPollOptionsLocked() {
+	path := s.pollOptionsPath()
+	if path == "" {
+		return
+	}
+	data, err := json.Marshal(s.pollOptions)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0o644)
+}
+
+func (s *AgentSession) storePollOptions(messageID string, options []string) {
+	if messageID == "" || len(options) == 0 {
+		return
+	}
+	copied := make([]string, len(options))
+	copy(copied, options)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.pollOptions[messageID]; !exists {
+		s.pollOrder = append(s.pollOrder, messageID)
+	}
+	s.pollOptions[messageID] = copied
+	for len(s.pollOrder) > maxPollOptionsStored {
+		oldest := s.pollOrder[0]
+		s.pollOrder = s.pollOrder[1:]
+		delete(s.pollOptions, oldest)
+	}
+	s.persistPollOptionsLocked()
+}
+
+func (s *AgentSession) getPollOptions(messageID string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	opts, ok := s.pollOptions[messageID]
+	if !ok || len(opts) == 0 {
+		return nil
+	}
+	out := make([]string, len(opts))
+	copy(out, opts)
+	return out
+}
+
+// handlePollVote desencripta el voto y lo reenvía al CRM como button_reply (opt_N / body=N).
+func (s *AgentSession) handlePollVote(evt *events.Message) {
+	if evt == nil || evt.Message == nil {
+		return
+	}
+	pollUpdate := evt.Message.GetPollUpdateMessage()
+	if pollUpdate == nil {
+		return
+	}
+
+	s.mu.RLock()
+	client := s.client
+	s.mu.RUnlock()
+	if client == nil {
+		fmt.Printf("[POLL_VOTE][%s] no client\n", s.AgentCode)
+		return
+	}
+
+	vote, err := client.DecryptPollVote(context.Background(), evt)
+	if err != nil {
+		fmt.Printf("[POLL_VOTE][%s] decrypt failed: %v\n", s.AgentCode, err)
+		return
+	}
+
+	pollKey := pollUpdate.GetPollCreationMessageKey()
+	pollID := ""
+	if pollKey != nil {
+		pollID = pollKey.GetID()
+	}
+	options := s.getPollOptions(pollID)
+	selectedIdx := -1
+	selectedText := ""
+
+	if len(options) > 0 {
+		hashes := whatsmeow.HashPollOptions(options)
+		for _, selected := range vote.GetSelectedOptions() {
+			for i, h := range hashes {
+				if bytes.Equal(selected, h) {
+					selectedIdx = i
+					selectedText = options[i]
+					break
+				}
+			}
+			if selectedIdx >= 0 {
+				break
+			}
+		}
+	}
+
+	msg := s.messageFromEvent(evt.Info, evt.Message)
+	msg.Type = "button_reply"
+	if selectedIdx >= 0 {
+		num := selectedIdx + 1
+		msg.ButtonID = fmt.Sprintf("opt_%d", num)
+		msg.Body = strconv.Itoa(num)
+	} else if selectedText != "" {
+		msg.Body = selectedText
+	} else {
+		// Sin opciones en memoria: no inventamos; logueamos para debug
+		fmt.Printf("[POLL_VOTE][%s] id=%s poll=%s — sin opciones guardadas (hashes=%d)\n",
+			s.AgentCode, msg.ID, pollID, len(vote.GetSelectedOptions()))
+		msg.Body = ""
+		msg.Type = "poll_vote"
+	}
+
+	fmt.Printf("[POLL_VOTE][%s] id=%s poll=%s button_id=%q body=%q option=%q\n",
+		s.AgentCode, msg.ID, pollID, msg.ButtonID, msg.Body, selectedText)
+
+	if msg.Body == "" && msg.ButtonID == "" {
+		return
+	}
+
+	s.appendMessage(msg)
+	s.dispatchWebhook("messages.upsert", msg)
+	s.dispatchWebhook("messages.button", msg)
 }
 
 func jidPhoneUser(jid types.JID) string {
