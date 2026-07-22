@@ -227,44 +227,8 @@ func buildButtonsMessage(req sendButtonsRequest) (*waE2E.Message, string, []waBi
 	var msgType string
 	var bizNativeName string
 
-	if hasReply && !hasOther && !hasPix {
-		content := strings.TrimSpace(req.Description)
-		if req.Title != "" {
-			content = "*" + req.Title + "*"
-			if strings.TrimSpace(req.Description) != "" {
-				content += "\n\n" + req.Description
-			}
-		}
-		replyButtons := make([]*waE2E.ButtonsMessage_Button, 0, len(req.Buttons))
-		for _, b := range req.Buttons {
-			id := strings.TrimSpace(b.ID)
-			if id == "" {
-				id = randomButtonID("btn")
-			}
-			replyButtons = append(replyButtons, &waE2E.ButtonsMessage_Button{
-				ButtonID: proto.String(id),
-				ButtonText: &waE2E.ButtonsMessage_Button_ButtonText{
-					DisplayText: proto.String(b.DisplayText),
-				},
-				Type: waE2E.ButtonsMessage_Button_RESPONSE.Enum(),
-			})
-		}
-		msg = &waE2E.Message{
-			DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
-				Message: &waE2E.Message{
-					ButtonsMessage: &waE2E.ButtonsMessage{
-						ContentText: proto.String(content),
-						FooterText:  proto.String(req.Footer),
-						HeaderType:  waE2E.ButtonsMessage_EMPTY.Enum(),
-						Buttons:     replyButtons,
-					},
-				},
-			},
-			MessageContextInfo: ctxInfo,
-		}
-		msgType = "ButtonsMessage"
-		bizNativeName = "quick_reply"
-	} else if hasPix {
+	// Reply (y resto): NativeFlow. ButtonsMessage clásico lo rechaza WA con 405.
+	if hasPix {
 		paymentParams := `{"native_flow_name":"order_details","version":1}`
 		var body *waE2E.InteractiveMessage_Body
 		if t := strings.TrimSpace(req.Title); t != "" {
@@ -322,7 +286,11 @@ func buildButtonsMessage(req sendButtonsRequest) (*waE2E.Message, string, []waBi
 			MessageContextInfo: ctxInfo,
 		}
 		msgType = "InteractiveMessage"
-		bizNativeName = "mixed"
+		if hasReply && !hasOther {
+			bizNativeName = "quick_reply"
+		} else {
+			bizNativeName = "mixed"
+		}
 	}
 
 	bizNodes := []waBinary.Node{
