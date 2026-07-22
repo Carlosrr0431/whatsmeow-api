@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"go.mau.fi/whatsmeow"
 	waBinary "go.mau.fi/whatsmeow/binary"
@@ -20,6 +22,7 @@ type sendListRow struct {
 	ID          string `json:"id"`
 	Title       string `json:"title"`
 	Description string `json:"description"`
+	Header      string `json:"header"`
 }
 
 type sendListSection struct {
@@ -37,20 +40,36 @@ type sendListRequest struct {
 	Sections    []sendListSection `json:"sections"`
 }
 
+func truncateRunes(s string, max int) string {
+	r := []rune(strings.TrimSpace(s))
+	if len(r) <= max {
+		return string(r)
+	}
+	return string(r[:max])
+}
+
+// buildListMessage usa NativeFlow single_select (mismo patrón que sendButtons).
+// ListMessage clásico suele llegar sin botón en clientes actuales.
 func buildListMessage(req sendListRequest) (*waE2E.Message, string, []waBinary.Node, error) {
 	if len(req.Sections) == 0 {
 		return nil, "", nil, fmt.Errorf("sections array is required")
 	}
 
+	btnText := strings.TrimSpace(req.ButtonText)
+	if btnText == "" {
+		btnText = "Ver opciones"
+	}
+	btnText = truncateRunes(btnText, 20)
+
 	totalRows := 0
-	sections := make([]*waE2E.ListMessage_Section, 0, len(req.Sections))
+	nfSections := make([]map[string]interface{}, 0, len(req.Sections))
 	for si, sec := range req.Sections {
 		if len(sec.Rows) == 0 {
 			return nil, "", nil, fmt.Errorf("sections[%d].rows no puede estar vacío", si)
 		}
-		rows := make([]*waE2E.ListMessage_Row, 0, len(sec.Rows))
+		rows := make([]map[string]interface{}, 0, len(sec.Rows))
 		for ri, row := range sec.Rows {
-			title := strings.TrimSpace(row.Title)
+			title := truncateRunes(row.Title, 24)
 			if title == "" {
 				return nil, "", nil, fmt.Errorf("sections[%d].rows[%d].title es requerido", si, ri)
 			}
@@ -58,20 +77,16 @@ func buildListMessage(req sendListRequest) (*waE2E.Message, string, []waBinary.N
 			if id == "" {
 				id = randomButtonID("row")
 			}
-			// WhatsApp: title ≤ 24, description ≤ 72 aprox.
-			if len([]rune(title)) > 24 {
-				r := []rune(title)
-				title = string(r[:24])
+			desc := truncateRunes(row.Description, 72)
+			header := truncateRunes(row.Header, 20)
+			if header == "" {
+				header = fmt.Sprintf("%d", totalRows+1)
 			}
-			desc := strings.TrimSpace(row.Description)
-			if len([]rune(desc)) > 72 {
-				r := []rune(desc)
-				desc = string(r[:72])
-			}
-			rows = append(rows, &waE2E.ListMessage_Row{
-				RowID:       proto.String(id),
-				Title:       proto.String(title),
-				Description: proto.String(desc),
+			rows = append(rows, map[string]interface{}{
+				"header":      header,
+				"title":       title,
+				"description": desc,
+				"id":          id,
 			})
 			totalRows++
 			if totalRows > maxListRows {
@@ -82,22 +97,20 @@ func buildListMessage(req sendListRequest) (*waE2E.Message, string, []waBinary.N
 		if secTitle == "" {
 			secTitle = "Opciones"
 		}
-		sections = append(sections, &waE2E.ListMessage_Section{
-			Title: proto.String(secTitle),
-			Rows:  rows,
+		nfSections = append(nfSections, map[string]interface{}{
+			"title": secTitle,
+			"rows":  rows,
 		})
 	}
 
-	btnText := strings.TrimSpace(req.ButtonText)
-	if btnText == "" {
-		btnText = "Ver opciones"
+	params := map[string]interface{}{
+		"title":    btnText,
+		"sections": nfSections,
 	}
-	title := strings.TrimSpace(req.Title)
-	if title == "" {
-		title = "Opciones"
+	paramsJSON, err := json.Marshal(params)
+	if err != nil {
+		return nil, "", nil, err
 	}
-	description := strings.TrimSpace(req.Description)
-	footer := strings.TrimSpace(req.Footer)
 
 	btnSecret := make([]byte, 32)
 	if _, err := cryptorand.Read(btnSecret); err != nil {
@@ -109,20 +122,40 @@ func buildListMessage(req sendListRequest) (*waE2E.Message, string, []waBinary.N
 		MessageSecret:             btnSecret,
 	}
 
-	listMsg := &waE2E.ListMessage{
-		Title:       proto.String(title),
-		Description: proto.String(description),
-		FooterText:  proto.String(footer),
-		ButtonText:  proto.String(btnText),
-		ListType:    waE2E.ListMessage_SINGLE_SELECT.Enum(),
-		Sections:    sections,
+	bodyText := strings.TrimSpace(req.Description)
+	if bodyText == "" {
+		bodyText = strings.TrimSpace(req.Title)
 	}
+	if bodyText == "" {
+		bodyText = "Elegí una opción de la lista."
+	}
+	// Evitar pedir "tocá Ver opciones" si el botón no llega: el botón nativo ya lo muestra.
+	footer := strings.TrimSpace(req.Footer)
 
-	// Mismo envoltorio que sendButtons (mejora entrega en clientes actuales).
+	templateID := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	messageParamsJSON := `{"from":"api","templateId":` + templateID + `}`
+
 	msg := &waE2E.Message{
 		DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
 			Message: &waE2E.Message{
-				ListMessage: listMsg,
+				InteractiveMessage: &waE2E.InteractiveMessage{
+					Body: &waE2E.InteractiveMessage_Body{Text: proto.String(bodyText)},
+					Footer: &waE2E.InteractiveMessage_Footer{
+						Text: proto.String(footer),
+					},
+					InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
+						NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
+							Buttons: []*waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton{
+								{
+									Name:             proto.String("single_select"),
+									ButtonParamsJSON: proto.String(string(paramsJSON)),
+								},
+							},
+							MessageParamsJSON: proto.String(messageParamsJSON),
+							MessageVersion:    proto.Int32(1),
+						},
+					},
+				},
 			},
 		},
 		MessageContextInfo: ctxInfo,
@@ -132,11 +165,17 @@ func buildListMessage(req sendListRequest) (*waE2E.Message, string, []waBinary.N
 		{
 			Tag: "biz",
 			Content: []waBinary.Node{{
-				Tag: "list",
+				Tag: "interactive",
 				Attrs: waBinary.Attrs{
-					"type": "single_select",
-					"v":    "2",
+					"type": "native_flow",
+					"v":    "1",
 				},
+				Content: []waBinary.Node{{
+					Tag: "native_flow",
+					Attrs: waBinary.Attrs{
+						"name": "single_select",
+					},
+				}},
 			}},
 		},
 		{
@@ -145,7 +184,7 @@ func buildListMessage(req sendListRequest) (*waE2E.Message, string, []waBinary.N
 		},
 	}
 
-	return msg, "ListMessage", bizNodes, nil
+	return msg, "InteractiveMessage_single_select", bizNodes, nil
 }
 
 func (app *App) handleV2SendList(w http.ResponseWriter, r *http.Request) {
