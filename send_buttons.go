@@ -265,24 +265,23 @@ func buildButtonsMessage(req sendButtonsRequest) (*waE2E.Message, string, []waBi
 		}
 		templateID := strconv.FormatInt(time.Now().UnixMilli(), 10)
 		messageParamsJSON := `{"from":"api","templateId":` + templateID + `}`
-		msg = &waE2E.Message{
-			DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
-				Message: &waE2E.Message{
-					InteractiveMessage: &waE2E.InteractiveMessage{
-						Body: &waE2E.InteractiveMessage_Body{Text: proto.String(body)},
-						Footer: &waE2E.InteractiveMessage_Footer{
-							Text: proto.String(req.Footer),
-						},
-						InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
-							NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
-								Buttons:           nativeButtons,
-								MessageParamsJSON: proto.String(messageParamsJSON),
-								MessageVersion:    proto.Int32(1),
-							},
-						},
-					},
+		msgVersion := int32(1)
+		// Sin DocumentWithCaption: ese wrapper hace que WA responda 405 en reply.
+		interactive := &waE2E.InteractiveMessage{
+			Body: &waE2E.InteractiveMessage_Body{Text: proto.String(body)},
+			Footer: &waE2E.InteractiveMessage_Footer{
+				Text: proto.String(req.Footer),
+			},
+			InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
+				NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
+					Buttons:           nativeButtons,
+					MessageParamsJSON: proto.String(messageParamsJSON),
+					MessageVersion:    proto.Int32(msgVersion),
 				},
 			},
+		}
+		msg = &waE2E.Message{
+			InteractiveMessage: interactive,
 			MessageContextInfo: ctxInfo,
 		}
 		msgType = "InteractiveMessage"
@@ -305,14 +304,11 @@ func buildButtonsMessage(req sendButtonsRequest) (*waE2E.Message, string, []waBi
 				Content: []waBinary.Node{{
 					Tag: "native_flow",
 					Attrs: waBinary.Attrs{
+						"v":    "9",
 						"name": bizNativeName,
 					},
 				}},
 			}},
-		},
-		{
-			Tag:   "bot",
-			Attrs: waBinary.Attrs{"biz_bot": "1"},
 		},
 	}
 
