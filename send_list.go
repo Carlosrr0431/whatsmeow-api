@@ -43,12 +43,12 @@ func buildListMessage(req sendListRequest) (*waE2E.Message, string, []waBinary.N
 	}
 
 	totalRows := 0
-	sections := make([]*waE2E.Section, 0, len(req.Sections))
+	sections := make([]*waE2E.ListMessage_Section, 0, len(req.Sections))
 	for si, sec := range req.Sections {
 		if len(sec.Rows) == 0 {
 			return nil, "", nil, fmt.Errorf("sections[%d].rows no puede estar vacío", si)
 		}
-		rows := make([]*waE2E.Row, 0, len(sec.Rows))
+		rows := make([]*waE2E.ListMessage_Row, 0, len(sec.Rows))
 		for ri, row := range sec.Rows {
 			title := strings.TrimSpace(row.Title)
 			if title == "" {
@@ -68,7 +68,7 @@ func buildListMessage(req sendListRequest) (*waE2E.Message, string, []waBinary.N
 				r := []rune(desc)
 				desc = string(r[:72])
 			}
-			rows = append(rows, &waE2E.Row{
+			rows = append(rows, &waE2E.ListMessage_Row{
 				RowID:       proto.String(id),
 				Title:       proto.String(title),
 				Description: proto.String(desc),
@@ -82,7 +82,7 @@ func buildListMessage(req sendListRequest) (*waE2E.Message, string, []waBinary.N
 		if secTitle == "" {
 			secTitle = "Opciones"
 		}
-		sections = append(sections, &waE2E.Section{
+		sections = append(sections, &waE2E.ListMessage_Section{
 			Title: proto.String(secTitle),
 			Rows:  rows,
 		})
