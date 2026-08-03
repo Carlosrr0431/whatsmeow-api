@@ -33,6 +33,35 @@ func NewApp() (*App, error) {
 	return &App{manager: manager}, nil
 }
 
+// resolveSendJID obtiene el JID real de destino.
+// WhatsApp moderno suele registrar usuarios como @lid; enviar a
+// 549…@s.whatsapp.net puede responder "Message sent" sin entregar.
+func resolveSendJID(client *whatsmeow.Client, phone string) types.JID {
+	phone = strings.TrimSpace(phone)
+	if phone == "" {
+		return types.EmptyJID
+	}
+	if strings.Contains(phone, "@") {
+		jid := parseJID(phone)
+		if jid.Server == types.HiddenUserServer {
+			return normalizeLIDJID(jid)
+		}
+		return jid
+	}
+	digits := strings.TrimPrefix(phone, "+")
+	digits = strings.ReplaceAll(digits, " ", "")
+	digits = strings.ReplaceAll(digits, "-", "")
+	resp, err := client.IsOnWhatsApp(context.Background(), []string{digits})
+	if err == nil && len(resp) > 0 && resp[0].IsIn {
+		jid := resp[0].JID
+		if jid.Server == types.HiddenUserServer {
+			return normalizeLIDJID(jid)
+		}
+		return jid
+	}
+	return parseJID(digits)
+}
+
 func agentCodeFromQuery(r *http.Request) string {
 	return strings.TrimSpace(r.URL.Query().Get("agent_code"))
 }
@@ -239,7 +268,7 @@ func (app *App) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jid := parseJID(req.Phone)
+	jid := resolveSendJID(client, req.Phone)
 	msg := &waE2E.Message{Conversation: proto.String(req.Message)}
 	resp, err := client.SendMessage(context.Background(), jid, msg)
 	if err != nil {
@@ -382,7 +411,7 @@ func (app *App) sendMediaInternal(w http.ResponseWriter, r *http.Request, req me
 		return
 	}
 
-	jid := parseJID(req.Phone)
+	jid := resolveSendJID(client, req.Phone)
 	var msg *waE2E.Message
 	switch mediaType {
 	case "image":

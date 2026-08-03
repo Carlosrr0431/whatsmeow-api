@@ -99,7 +99,7 @@ func (app *App) handleV2SendPoll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	msg := client.BuildPollCreation(name, opts, maxSel)
-	jid := parseJID(phone)
+	jid := resolveSendJID(client, phone)
 	resp, err := client.SendMessage(context.Background(), jid, msg)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})

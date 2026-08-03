@@ -371,7 +371,7 @@ func (app *App) handleV2SendButtons(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jid := parseJID(phone)
+	jid := resolveSendJID(client, phone)
 	resp, err := client.SendMessage(context.Background(), jid, msg, whatsmeow.SendRequestExtra{
 		AdditionalNodes: &bizNodes,
 	})
