@@ -163,10 +163,28 @@ func (app *App) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	msg := "Reconnecting with existing session"
+	data := map[string]interface{}{"needs_qr": needsQR}
 	if needsQR {
 		msg = "QR code generated. Use GET /api/session/qr?agent_code=" + req.AgentCode
+		// Connect returns before the first QR event; wait briefly so the CRM can show it without polling.
+		var qr string
+		for i := 0; i < 40; i++ {
+			qr = s.GetQR()
+			if qr != "" {
+				break
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		if qr != "" {
+			data["qr_code"] = qr
+			if png, encErr := qrcode.Encode(qr, qrcode.Medium, 512); encErr == nil {
+				data["qr_image"] = "data:image/png;base64," + base64.StdEncoding.EncodeToString(png)
+			}
+			data["expires_in"] = "60s"
+			data["agent_code"] = req.AgentCode
+		}
 	}
-	writeJSON(w, http.StatusOK, APIResponse{Success: true, Message: msg, Data: map[string]interface{}{"needs_qr": needsQR}})
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Message: msg, Data: data})
 }
 
 func (app *App) handleGetQR(w http.ResponseWriter, r *http.Request) {
