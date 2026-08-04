@@ -106,7 +106,15 @@ func (app *App) handleV2SendPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.storeSentMessage(resp.ID, jid.String(), name, "PollCreation", resp.Timestamp.Unix())
+	phoneHint := ""
+	if !strings.Contains(phone, "@") {
+		phoneHint = strings.TrimPrefix(phone, "+")
+		phoneHint = strings.ReplaceAll(phoneHint, " ", "")
+		phoneHint = strings.ReplaceAll(phoneHint, "-", "")
+	} else if strings.HasSuffix(phone, "@s.whatsapp.net") {
+		phoneHint = strings.Split(phone, "@")[0]
+	}
+	s.storeSentMessage(resp.ID, jid.String(), name, "PollCreation", resp.Timestamp.Unix(), phoneHint)
 	s.storePollOptions(resp.ID, opts)
 	fmt.Printf("[POLL][%s] → %s id=%s options=%d\n", req.AgentCode, phone, resp.ID, len(opts))
 
