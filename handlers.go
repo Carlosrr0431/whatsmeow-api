@@ -275,7 +275,17 @@ func (app *App) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
 		return
 	}
-	s.storeSentMessage(resp.ID, jid.String(), req.Message, "text", resp.Timestamp.Unix())
+	phoneHint := ""
+	rawPhone := strings.TrimSpace(req.Phone)
+	if !strings.Contains(rawPhone, "@") {
+		phoneHint = strings.TrimPrefix(rawPhone, "+")
+		phoneHint = strings.ReplaceAll(phoneHint, " ", "")
+		phoneHint = strings.ReplaceAll(phoneHint, "-", "")
+	} else if strings.Contains(rawPhone, "@"+types.DefaultUserServer) {
+		phoneHint = strings.Split(rawPhone, "@")[0]
+		phoneHint = stripDeviceFromUser(phoneHint)
+	}
+	s.storeSentMessage(resp.ID, jid.String(), req.Message, "text", resp.Timestamp.Unix(), phoneHint)
 	writeJSON(w, http.StatusOK, APIResponse{
 		Success: true,
 		Message: "Message sent",

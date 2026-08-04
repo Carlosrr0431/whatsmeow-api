@@ -934,7 +934,7 @@ func (s *AgentSession) Messages() []MessageEvent {
 	return out
 }
 
-func (s *AgentSession) storeSentMessage(id, toJID, body, msgType string, timestamp int64) {
+func (s *AgentSession) storeSentMessage(id, toJID, body, msgType string, timestamp int64, phoneHint ...string) {
 	myJID := ""
 	s.mu.RLock()
 	if s.client != nil && s.client.Store.ID != nil {
@@ -954,7 +954,26 @@ func (s *AgentSession) storeSentMessage(id, toJID, body, msgType string, timesta
 		IsFromMe:  true,
 		PushName:  "Yo",
 	}
+
+	// Completar sender_pn / sender_lid para que el CRM pueda resolver el teléfono
+	// (los envíos vía API no generan events.Message de WhatsApp).
+	parsed := parseJID(toJID)
+	if parsed.Server == types.DefaultUserServer && parsed.User != "" {
+		msg.SenderPN = parsed.User
+	} else if parsed.Server == types.HiddenUserServer {
+		msg.SenderLID = stripDeviceFromUser(parsed.User)
+		if _, pnUser := s.resolvePNFromLID(parsed); pnUser != "" {
+			msg.SenderPN = pnUser
+		}
+	}
+	if msg.SenderPN == "" && len(phoneHint) > 0 && phoneHint[0] != "" {
+		msg.SenderPN = phoneHint[0]
+	}
+
 	s.appendMessage(msg)
+	// Persistir en CRM: sin esto, los recordatorios/cron aparecen "enviados"
+	// en logs pero nunca llegan a chats/messages de Supabase.
+	s.dispatchWebhook("messages.upsert", msg)
 }
 
 const maxPollOptionsStored = 200
