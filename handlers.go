@@ -507,11 +507,23 @@ func (app *App) sendMediaInternal(w http.ResponseWriter, r *http.Request, req me
 		return
 	}
 
+	// Cache del proto para que GET /api/messages/media/{id} pueda servir el archivo.
+	s.storeRawMedia(resp.ID, msg)
+
 	body := req.Caption
 	if body == "" {
 		body = req.Filename
 	}
-	s.storeSentMessage(resp.ID, jid.String(), body, mediaType, resp.Timestamp.Unix())
+	phoneHint := ""
+	rawPhone := strings.TrimSpace(req.Phone)
+	if !strings.Contains(rawPhone, "@") {
+		phoneHint = strings.TrimPrefix(rawPhone, "+")
+		phoneHint = strings.ReplaceAll(phoneHint, " ", "")
+		phoneHint = strings.ReplaceAll(phoneHint, "-", "")
+	} else if strings.HasSuffix(rawPhone, "@s.whatsapp.net") {
+		phoneHint = strings.Split(rawPhone, "@")[0]
+	}
+	s.storeSentMessage(resp.ID, jid.String(), body, mediaType, resp.Timestamp.Unix(), phoneHint)
 	writeJSON(w, http.StatusOK, APIResponse{
 		Success: true,
 		Message: "Media sent",
