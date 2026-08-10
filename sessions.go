@@ -902,7 +902,9 @@ func (s *AgentSession) Disconnect() {
 	if s.client != nil {
 		s.client.Disconnect()
 	}
+	s.client = nil
 	s.connected = false
+	s.qrCode = ""
 }
 
 func (s *AgentSession) Logout(ctx context.Context) error {
