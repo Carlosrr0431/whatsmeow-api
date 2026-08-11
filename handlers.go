@@ -33,6 +33,23 @@ func NewApp() (*App, error) {
 	return &App{manager: manager}, nil
 }
 
+// clientReadyForSend reconecta websocket caído (sesión guardada) antes de enviar.
+func (app *App) clientReadyForSend(w http.ResponseWriter, s *AgentSession) (*whatsmeow.Client, bool) {
+	if err := s.EnsureConnected(); err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{
+			Success: false,
+			Message: "WhatsApp not connected for this agent: " + err.Error(),
+		})
+		return nil, false
+	}
+	client, connected := s.Client()
+	if !connected {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WhatsApp not connected for this agent"})
+		return nil, false
+	}
+	return client, true
+}
+
 // resolveSendJID obtiene el JID real de destino.
 // WhatsApp moderno suele registrar usuarios como @lid; enviar a
 // 549…@s.whatsapp.net puede responder "Message sent" sin entregar.
@@ -276,9 +293,8 @@ func (app *App) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	client, connected := s.Client()
-	if !connected {
-		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WhatsApp not connected for this agent"})
+	client, okClient := app.clientReadyForSend(w, s)
+	if !okClient {
 		return
 	}
 	if req.Phone == "" || req.Message == "" {
@@ -289,6 +305,15 @@ func (app *App) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 	jid := resolveSendJID(client, req.Phone)
 	msg := &waE2E.Message{Conversation: proto.String(req.Message)}
 	resp, err := client.SendMessage(context.Background(), jid, msg)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "websocket not connected") {
+		if err2 := s.EnsureConnected(); err2 == nil {
+			if c2, ok2 := s.Client(); ok2 {
+				client = c2
+				jid = resolveSendJID(client, req.Phone)
+				resp, err = client.SendMessage(context.Background(), jid, msg)
+			}
+		}
+	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
 		return
@@ -377,9 +402,8 @@ func (app *App) sendMediaInternal(w http.ResponseWriter, r *http.Request, req me
 	if !ok {
 		return
 	}
-	client, connected := s.Client()
-	if !connected {
-		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WhatsApp not connected for this agent"})
+	client, okClient := app.clientReadyForSend(w, s)
+	if !okClient {
 		return
 	}
 	if req.Phone == "" || req.Media == "" {
@@ -434,6 +458,14 @@ func (app *App) sendMediaInternal(w http.ResponseWriter, r *http.Request, req me
 	}
 
 	uploaded, err := client.Upload(context.Background(), data, uploadType)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "websocket not connected") {
+		if err2 := s.EnsureConnected(); err2 == nil {
+			if c2, ok2 := s.Client(); ok2 {
+				client = c2
+				uploaded, err = client.Upload(context.Background(), data, uploadType)
+			}
+		}
+	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
 		return
@@ -502,12 +534,19 @@ func (app *App) sendMediaInternal(w http.ResponseWriter, r *http.Request, req me
 	}
 
 	resp, err := client.SendMessage(context.Background(), jid, msg)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "websocket not connected") {
+		if err2 := s.EnsureConnected(); err2 == nil {
+			if c2, ok2 := s.Client(); ok2 {
+				client = c2
+				jid = resolveSendJID(client, req.Phone)
+				resp, err = client.SendMessage(context.Background(), jid, msg)
+			}
+		}
+	}
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
 		return
 	}
-
-	// Cache del proto para que GET /api/messages/media/{id} pueda servir el archivo.
 	s.storeRawMedia(resp.ID, msg)
 
 	body := req.Caption
@@ -792,9 +831,8 @@ func (app *App) handleCheckNumber(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Message: "Session not found"})
 		return
 	}
-	client, connected := s.Client()
-	if !connected {
-		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WhatsApp not connected"})
+	client, okClient := app.clientReadyForSend(w, s)
+	if !okClient {
 		return
 	}
 	phone := r.URL.Query().Get("phone")
@@ -804,8 +842,19 @@ func (app *App) handleCheckNumber(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := client.IsOnWhatsApp(context.Background(), []string{phone})
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
-		return
+		// Reintento único si el WS cayó mid-query
+		if strings.Contains(strings.ToLower(err.Error()), "websocket not connected") {
+			if err2 := s.EnsureConnected(); err2 == nil {
+				client2, ok2 := s.Client()
+				if ok2 {
+					resp, err = client2.IsOnWhatsApp(context.Background(), []string{phone})
+				}
+			}
+		}
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
+			return
+		}
 	}
 	if len(resp) == 0 {
 		writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"registered": false}})

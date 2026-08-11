@@ -86,9 +86,8 @@ func (app *App) handleV2SendPoll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Message: "Session not found"})
 		return
 	}
-	client, connected := s.Client()
-	if !connected {
-		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WhatsApp not connected for this agent"})
+	client, okClient := app.clientReadyForSend(w, s)
+	if !okClient {
 		return
 	}
 

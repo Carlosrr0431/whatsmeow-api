@@ -478,14 +478,17 @@ func (s *AgentSession) StatusInfo() SessionStatusInfo {
 		info.Phone = s.client.Store.ID.User
 	}
 
-	// connected=true sin Store.ID = websocket esperando QR (NO es sesión usable)
-	if loggedIn && s.connected {
+	liveWS := s.client != nil && s.client.IsConnected()
+	// Preferir websocket real; flag stale con WS caído → disconnected (has_session true)
+	if loggedIn && liveWS {
 		info.Connected = true
 		info.Status = "connected"
+	} else if loggedIn && !liveWS {
+		info.Connected = false
+		info.HasSession = true
+		info.Status = "disconnected"
 	} else if s.client != nil && s.qrCode != "" {
 		info.Status = "need_scan"
-	} else if loggedIn {
-		info.Status = "connecting"
 	} else if s.client != nil {
 		info.Status = "need_scan"
 	} else {
@@ -812,9 +815,17 @@ func (s *AgentSession) appendMessage(msg MessageEvent) {
 
 func (s *AgentSession) connectExisting() error {
 	s.mu.Lock()
-	if s.connected && s.client != nil {
+	if s.client != nil && s.client.IsConnected() && s.isLoggedInLocked() {
+		s.connected = true
 		s.mu.Unlock()
 		return nil
+	}
+
+	// Websocket muerto / flag stale: limpiar y reconectar con la sesión guardada
+	if s.client != nil {
+		s.client.Disconnect()
+		s.client = nil
+		s.connected = false
 	}
 
 	clientLog := newClientLogger(s.AgentCode)
@@ -835,9 +846,17 @@ func (s *AgentSession) connectExisting() error {
 
 func (s *AgentSession) Connect() (needsQR bool, err error) {
 	s.mu.Lock()
-	if s.connected && s.client != nil {
+	if s.client != nil && s.client.IsConnected() && s.isLoggedInLocked() {
+		s.connected = true
 		s.mu.Unlock()
 		return false, nil
+	}
+
+	// Flag "connected" con websocket caído → forzar reconexión real
+	if s.client != nil {
+		s.client.Disconnect()
+		s.client = nil
+		s.connected = false
 	}
 
 	deviceStore, err := s.container.GetFirstDevice(context.Background())
@@ -922,10 +941,36 @@ func (s *AgentSession) Logout(ctx context.Context) error {
 func (s *AgentSession) Client() (*whatsmeow.Client, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if !s.connected || !s.isLoggedInLocked() {
+	if s.client == nil || !s.isLoggedInLocked() {
+		return nil, false
+	}
+	// No confiar solo en s.connected: puede quedar true con websocket muerto
+	// (luego falla usync: "websocket not connected").
+	if !s.client.IsConnected() {
 		return nil, false
 	}
 	return s.client, true
+}
+
+// EnsureConnected reconecta si hay sesión guardada pero el websocket está caído.
+func (s *AgentSession) EnsureConnected() error {
+	if _, ok := s.Client(); ok {
+		return nil
+	}
+	_, err := s.Connect()
+	if err != nil {
+		return err
+	}
+	for i := 0; i < 15; i++ {
+		if _, ok := s.Client(); ok {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if _, ok := s.Client(); ok {
+		return nil
+	}
+	return fmt.Errorf("websocket still not connected after reconnect")
 }
 
 func (s *AgentSession) Messages() []MessageEvent {
