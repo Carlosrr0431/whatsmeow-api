@@ -1535,7 +1535,20 @@ func extractMessageContent(msg *waE2E.Message, evt *MessageEvent) {
 	case msg.GetLocationMessage() != nil:
 		evt.Type = "location"
 		loc := msg.GetLocationMessage()
-		evt.Body = fmt.Sprintf("📍 %.6f, %.6f", loc.GetDegreesLatitude(), loc.GetDegreesLongitude())
+		evt.Latitude = loc.GetDegreesLatitude()
+		evt.Longitude = loc.GetDegreesLongitude()
+		evt.Address = strings.TrimSpace(loc.GetName())
+		if addr := strings.TrimSpace(loc.GetAddress()); addr != "" {
+			if evt.Address != "" {
+				evt.Address = evt.Address + " — " + addr
+			} else {
+				evt.Address = addr
+			}
+		}
+		evt.Body = fmt.Sprintf("📍 %.6f, %.6f", evt.Latitude, evt.Longitude)
+		if evt.Address != "" {
+			evt.Body = evt.Address
+		}
 	case msg.GetReactionMessage() != nil:
 		rm := msg.GetReactionMessage()
 		evt.Type = "reaction"

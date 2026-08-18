@@ -45,6 +45,9 @@ type MessageEvent struct {
 	ButtonID           string `json:"button_id,omitempty"`
 	PollID             string `json:"poll_id,omitempty"`
 	PollOption         string `json:"poll_option,omitempty"`
+	Latitude           float64 `json:"latitude,omitempty"`
+	Longitude          float64 `json:"longitude,omitempty"`
+	Address            string  `json:"address,omitempty"`
 }
 
 type APIResponse struct {
@@ -77,10 +80,16 @@ func parseJID(phone string) types.JID {
 	phone = strings.ReplaceAll(phone, "-", "")
 
 	if strings.Contains(phone, "@") {
-		jid, _ := types.ParseJID(phone)
-		return jid
+		jid, err := types.ParseJID(phone)
+		if err != nil {
+			return types.EmptyJID
+		}
+		if jid.Server == types.HiddenUserServer {
+			return normalizeLIDJID(jid)
+		}
+		return jid.ToNonAD()
 	}
-	return types.NewJID(phone, types.DefaultUserServer)
+	return types.NewJID(stripDeviceFromUser(phone), types.DefaultUserServer)
 }
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {

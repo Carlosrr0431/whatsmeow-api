@@ -63,14 +63,15 @@ func resolveSendJID(client *whatsmeow.Client, phone string) types.JID {
 		if jid.Server == types.HiddenUserServer {
 			return normalizeLIDJID(jid)
 		}
-		return jid
+		return jid.ToNonAD()
 	}
 	digits := strings.TrimPrefix(phone, "+")
 	digits = strings.ReplaceAll(digits, " ", "")
 	digits = strings.ReplaceAll(digits, "-", "")
+	digits = stripDeviceFromUser(digits)
 	resp, err := client.IsOnWhatsApp(context.Background(), []string{digits})
 	if err == nil && len(resp) > 0 && resp[0].IsIn {
-		jid := resp[0].JID
+		jid := resp[0].JID.ToNonAD()
 		if jid.Server == types.HiddenUserServer {
 			return normalizeLIDJID(jid)
 		}
@@ -139,6 +140,7 @@ func (app *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Success: true,
 		Data: map[string]interface{}{
 			"status":      info.Status,
+			"connected":   info.Connected,
 			"phone":       info.Phone,
 			"has_session": info.HasSession,
 			"agent_code":  info.AgentCode,
@@ -860,7 +862,7 @@ func (app *App) handleCheckNumber(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"registered": false}})
 		return
 	}
-	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"registered": resp[0].IsIn, "jid": resp[0].JID.String()}})
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"registered": resp[0].IsIn, "jid": resp[0].JID.ToNonAD().String()}})
 }
 
 func (app *App) handleSendGroupMessage(w http.ResponseWriter, r *http.Request) {
