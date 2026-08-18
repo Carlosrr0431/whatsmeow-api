@@ -1102,6 +1102,65 @@ func (s *AgentSession) getPollOptions(messageID string) []string {
 	return out
 }
 
+func matchPollSelection(options []string, selected [][]byte) (int, string) {
+	if len(options) == 0 || len(selected) == 0 {
+		return -1, ""
+	}
+	hashes := whatsmeow.HashPollOptions(options)
+	for _, sel := range selected {
+		for i, h := range hashes {
+			if bytes.Equal(sel, h) {
+				return i, options[i]
+			}
+		}
+	}
+	return -1, ""
+}
+
+func (s *AgentSession) resolvePollVote(pollID string, selected [][]byte) (options []string, idx int, text string) {
+	if pollID != "" {
+		options = s.getPollOptions(pollID)
+		if idx, text = matchPollSelection(options, selected); idx >= 0 {
+			return options, idx, text
+		}
+	}
+
+	s.mu.RLock()
+	ids := append([]string(nil), s.pollOrder...)
+	copied := make(map[string][]string, len(s.pollOptions))
+	for id, opts := range s.pollOptions {
+		next := make([]string, len(opts))
+		copy(next, opts)
+		copied[id] = next
+	}
+	s.mu.RUnlock()
+
+	for i := len(ids) - 1; i >= 0; i-- {
+		opts := copied[ids[i]]
+		if idx, text = matchPollSelection(opts, selected); idx >= 0 {
+			return opts, idx, text
+		}
+	}
+	return nil, -1, ""
+}
+
+func (s *AgentSession) pollVoterPhone(info types.MessageInfo) string {
+	if phone := s.resolveJIDToPhone(info.Chat); phone != "" {
+		return phone
+	}
+	if info.RecipientAlt.User != "" {
+		if phone := s.resolveJIDToPhone(info.RecipientAlt); phone != "" {
+			return phone
+		}
+	}
+	if info.SenderAlt.User != "" {
+		if phone := s.resolveJIDToPhone(info.SenderAlt); phone != "" {
+			return phone
+		}
+	}
+	return s.resolveJIDToPhone(info.Sender)
+}
+
 // handlePollVote desencripta el voto y lo reenvía al CRM como button_reply (opt_N / body=N).
 func (s *AgentSession) handlePollVote(evt *events.Message) {
 	if evt == nil || evt.Message == nil {
@@ -1131,54 +1190,38 @@ func (s *AgentSession) handlePollVote(evt *events.Message) {
 	if pollKey != nil {
 		pollID = pollKey.GetID()
 	}
-	options := s.getPollOptions(pollID)
-	selectedIdx := -1
-	selectedText := ""
-
-	if len(options) > 0 {
-		hashes := whatsmeow.HashPollOptions(options)
-		for _, selected := range vote.GetSelectedOptions() {
-			for i, h := range hashes {
-				if bytes.Equal(selected, h) {
-					selectedIdx = i
-					selectedText = options[i]
-					break
-				}
-			}
-			if selectedIdx >= 0 {
-				break
-			}
-		}
-	}
+	_, selectedIdx, selectedText := s.resolvePollVote(pollID, vote.GetSelectedOptions())
 
 	msg := s.messageFromEvent(evt.Info, evt.Message)
 	msg.Type = "button_reply"
 	msg.PollID = pollID
+	msg.IsFromMe = false
+	if voter := s.pollVoterPhone(evt.Info); voter != "" {
+		msg.SenderPN = voter
+	}
 	if selectedIdx >= 0 {
 		num := selectedIdx + 1
 		msg.ButtonID = fmt.Sprintf("opt_%d", num)
-		msg.Body = strconv.Itoa(num)
+		msg.Body = selectedText
 		msg.PollOption = selectedText
 	} else if selectedText != "" {
 		msg.Body = selectedText
 		msg.PollOption = selectedText
 	} else {
-		// Sin opciones en memoria: no inventamos; logueamos para debug
 		fmt.Printf("[POLL_VOTE][%s] id=%s poll=%s — sin opciones guardadas (hashes=%d)\n",
 			s.AgentCode, msg.ID, pollID, len(vote.GetSelectedOptions()))
 		msg.Body = ""
 		msg.Type = "poll_vote"
 	}
 
-	fmt.Printf("[POLL_VOTE][%s] id=%s poll=%s button_id=%q body=%q option=%q\n",
-		s.AgentCode, msg.ID, pollID, msg.ButtonID, msg.Body, selectedText)
+	fmt.Printf("[POLL_VOTE][%s] id=%s poll=%s fromMe=%v pn=%s button_id=%q body=%q option=%q\n",
+		s.AgentCode, msg.ID, pollID, evt.Info.IsFromMe, msg.SenderPN, msg.ButtonID, msg.Body, selectedText)
 
 	if msg.Body == "" && msg.ButtonID == "" {
 		return
 	}
 
 	s.appendMessage(msg)
-	// Compat CRM: upsert + button (opt_N) + evento dedicado poll
 	s.dispatchWebhook("messages.upsert", msg)
 	s.dispatchWebhook("messages.button", msg)
 	s.dispatchWebhook("messages.poll", msg)
