@@ -1,10 +1,11 @@
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 RUN apk add --no-cache gcc musl-dev sqlite-dev git ca-certificates
 
 WORKDIR /app
 
 COPY . .
+ENV GOTOOLCHAIN=auto
 RUN go get go.mau.fi/whatsmeow@latest && \
     go get github.com/mattn/go-sqlite3@latest && \
     go get github.com/skip2/go-qrcode@latest && \
