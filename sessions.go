@@ -63,6 +63,8 @@ type AgentSession struct {
 	undecryptableOrder []string
 	jidByPhone         map[string]jidCacheEntry
 	lastOnWAQuery      time.Time
+	lastPollVoteKey    string
+	lastPollVoteAt     time.Time
 	statusNotifyMu     sync.Mutex
 	disconnectTimer    *time.Timer
 	disconnectNotified bool
@@ -1229,8 +1231,19 @@ func (s *AgentSession) handlePollVote(evt *events.Message) {
 	}
 
 	s.appendMessage(msg)
-	s.dispatchWebhook("messages.upsert", msg)
-	s.dispatchWebhook("messages.button", msg)
+
+	voteKey := strings.TrimSpace(pollID) + "|" + strings.TrimSpace(msg.SenderPN) + "|" + strings.TrimSpace(msg.PollOption+msg.ButtonID+msg.Body)
+	s.mu.Lock()
+	if voteKey != "" && voteKey == s.lastPollVoteKey && time.Since(s.lastPollVoteAt) < 15*time.Second {
+		s.mu.Unlock()
+		fmt.Printf("[POLL_VOTE][%s] duplicado ignorado key=%s\n", s.AgentCode, voteKey)
+		return
+	}
+	s.lastPollVoteKey = voteKey
+	s.lastPollVoteAt = time.Now()
+	s.mu.Unlock()
+
+	// Un solo webhook: upsert+button+poll disparaba 3 respuestas y Meta lo marca como spam.
 	s.dispatchWebhook("messages.poll", msg)
 }
 
