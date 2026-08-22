@@ -238,8 +238,8 @@ func (app *App) handleV2SendList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jid := resolveSendJID(client, phone)
-	resp, err := client.SendMessage(context.Background(), jid, msg, whatsmeow.SendRequestExtra{
+	jid := s.resolveSendJID(client, phone)
+	resp, err := s.sendWithHumanPacing(client, jid, msg, whatsmeow.SendRequestExtra{
 		AdditionalNodes: &bizNodes,
 	})
 	if err != nil {

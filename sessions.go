@@ -61,6 +61,8 @@ type AgentSession struct {
 	pollOrder          []string
 	undecryptableSeen  map[string]struct{}
 	undecryptableOrder []string
+	jidByPhone         map[string]jidCacheEntry
+	lastOnWAQuery      time.Time
 	statusNotifyMu     sync.Mutex
 	disconnectTimer    *time.Timer
 	disconnectNotified bool
@@ -260,11 +262,13 @@ func (sm *SessionManager) initSession(agentCode, webhookURL, webhookSecret strin
 		pollOrder:          make([]string, 0),
 		undecryptableSeen:  make(map[string]struct{}),
 		undecryptableOrder: make([]string, 0),
+		jidByPhone:         make(map[string]jidCacheEntry),
 		manager:            sm,
 		httpClient:         sm.httpClient,
 		sessionDir:         dbDir,
 	}
 	s.loadPollOptionsFromDisk()
+	s.loadJIDCacheFromDisk()
 	sm.sessions[agentCode] = s
 	return s, nil
 }
@@ -1016,6 +1020,9 @@ func (s *AgentSession) storeSentMessage(id, toJID, body, msgType string, timesta
 	if msg.SenderPN == "" && len(phoneHint) > 0 && phoneHint[0] != "" {
 		msg.SenderPN = phoneHint[0]
 	}
+	if !parsed.IsEmpty() && msg.SenderPN != "" {
+		s.rememberPeerJID(msg.SenderPN, parsed)
+	}
 
 	s.appendMessage(msg)
 	// Persistir en CRM: sin esto, los recordatorios/cron aparecen "enviados"
@@ -1357,6 +1364,7 @@ func (s *AgentSession) messageFromEvent(info types.MessageInfo, message *waE2E.M
 	if msg.Type == "" {
 		msg.Type = "unknown"
 	}
+	s.rememberInboundPeer(info, senderPN, chatJID)
 	return msg
 }
 

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -98,8 +97,8 @@ func (app *App) handleV2SendPoll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	msg := client.BuildPollCreation(name, opts, maxSel)
-	jid := resolveSendJID(client, phone)
-	resp, err := client.SendMessage(context.Background(), jid, msg)
+	jid := s.resolveSendJID(client, phone)
+	resp, err := s.sendWithHumanPacing(client, jid, msg)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
 		return
