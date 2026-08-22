@@ -819,6 +819,10 @@ func (app *App) handleCheckNumber(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"registered": true, "jid": cached.String(), "cached": true}})
 		return
 	}
+	if !s.allowOnWhatsAppQuery() {
+		writeJSON(w, http.StatusTooManyRequests, APIResponse{Success: false, Message: "check-number throttled"})
+		return
+	}
 	resp, err := client.IsOnWhatsApp(context.Background(), []string{phone})
 	if err != nil {
 		// Reintento único si el WS cayó mid-query
