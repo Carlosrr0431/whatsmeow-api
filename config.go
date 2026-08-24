@@ -15,9 +15,10 @@ var (
 	verboseLogs            bool
 	clientLogLevel         string
 	sqliteBusyTimeoutMS    int
-	autoConnectStaggerSec  int
-	autoConnectDelaySec    int
-	shutdownWaitSec        int
+	autoConnectStaggerSec    int
+	autoConnectDelaySec      int
+	reconnectWatchSec        int
+	shutdownWaitSec          int
 	sessionStatusDebounceSec int
 )
 
@@ -27,8 +28,9 @@ func initRuntimeConfig() {
 	skipGroupsAndBroadcast = envBool("SKIP_GROUPS", true)
 	verboseLogs = envBool("VERBOSE_LOGS", false)
 	sqliteBusyTimeoutMS = envInt("SQLITE_BUSY_TIMEOUT_MS", 15000)
-	autoConnectStaggerSec = envInt("AUTO_CONNECT_STAGGER_SEC", 3)
-	autoConnectDelaySec = envInt("AUTO_CONNECT_DELAY_SEC", 2)
+	autoConnectStaggerSec = envInt("AUTO_CONNECT_STAGGER_SEC", 20)
+	autoConnectDelaySec = envInt("AUTO_CONNECT_DELAY_SEC", 5)
+	reconnectWatchSec = envInt("RECONNECT_WATCH_SEC", 15)
 	shutdownWaitSec = envInt("SHUTDOWN_WAIT_SEC", 2)
 	sessionStatusDebounceSec = envInt("SESSION_STATUS_DEBOUNCE_SEC", 15)
 	clientLogLevel = strings.TrimSpace(strings.ToUpper(os.Getenv("CLIENT_LOG_LEVEL")))

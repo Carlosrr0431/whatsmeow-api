@@ -145,6 +145,20 @@ func (app *App) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if info := s.StatusInfo(); info.Connected {
+		writeJSON(w, http.StatusOK, APIResponse{
+			Success: true,
+			Message: "Already connected",
+			Data: map[string]interface{}{
+				"needs_qr":   false,
+				"agent_code": req.AgentCode,
+				"phone":      info.Phone,
+				"status":     "connected",
+			},
+		})
+		return
+	}
+
 	needsQR, err := s.Connect()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: fmt.Sprintf("Failed to connect: %v", err)})

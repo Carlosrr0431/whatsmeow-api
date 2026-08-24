@@ -212,20 +212,12 @@ func main() {
 			time.Sleep(delay)
 		}
 		app.manager.AutoConnectAll()
-		// Pasadas extras: tras redeploy algunas sesiones fallan el primer connect
-		for _, waitSec := range []int{45, 90, 180} {
-			time.Sleep(time.Duration(waitSec) * time.Second)
-			if app.manager.IsDraining() {
-				return
-			}
-			fmt.Printf("[SESSIONS] Reconnect pass (+%ds) for offline agents...\n", waitSec)
-			app.manager.ReconnectDisconnected()
-		}
-	}()
 
-	// Watchdog: cada 2 min reconecta sesiones con device que quedaron offline (sin logout)
-	go func() {
-		ticker := time.NewTicker(2 * time.Minute)
+		watchSec := reconnectWatchSec
+		if watchSec <= 0 {
+			watchSec = 15
+		}
+		ticker := time.NewTicker(time.Duration(watchSec) * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			if app.manager.IsDraining() {

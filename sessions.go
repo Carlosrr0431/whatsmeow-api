@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,6 +69,12 @@ type AgentSession struct {
 	statusNotifyMu     sync.Mutex
 	disconnectTimer    *time.Timer
 	disconnectNotified bool
+	loggedOut          bool
+	reconnecting       bool
+	reconnectAttempt   int
+	nextReconnectAt    time.Time
+	lastDisconnectAt   time.Time
+	lastConnectedAt    time.Time
 	mu                 sync.RWMutex
 
 	manager    *SessionManager
@@ -88,8 +95,8 @@ type SessionManager struct {
 
 func NewSessionManager(dataDir, defaultSecret string) (*SessionManager, error) {
 	initRuntimeConfig()
-	fmt.Printf("[CONFIG] max_msg_history=%d max_raw_media=%d skip_groups=%v client_log=%s sqlite_busy_ms=%d connect_stagger_sec=%d connect_delay_sec=%d shutdown_wait_sec=%d status_debounce_sec=%d\n",
-		maxMsgHistLimit, maxRawMediaLimit, skipGroupsAndBroadcast, clientLogLevel, sqliteBusyTimeoutMS, autoConnectStaggerSec, autoConnectDelaySec, shutdownWaitSec, sessionStatusDebounceSec)
+	fmt.Printf("[CONFIG] max_msg_history=%d max_raw_media=%d skip_groups=%v client_log=%s sqlite_busy_ms=%d connect_stagger_sec=%d connect_delay_sec=%d reconnect_watch_sec=%d shutdown_wait_sec=%d status_debounce_sec=%d\n",
+		maxMsgHistLimit, maxRawMediaLimit, skipGroupsAndBroadcast, clientLogLevel, sqliteBusyTimeoutMS, autoConnectStaggerSec, autoConnectDelaySec, reconnectWatchSec, shutdownWaitSec, sessionStatusDebounceSec)
 
 	if dataDir == "" {
 		dataDir = "/app/data"
@@ -387,17 +394,23 @@ func (sm *SessionManager) DisconnectAll() {
 	fmt.Println("[SESSIONS] All WhatsApp clients disconnected")
 }
 
-func (sm *SessionManager) AutoConnectAll() {
+func (sm *SessionManager) sortedAgentCodes() []string {
 	sm.mu.RLock()
 	codes := make([]string, 0, len(sm.registry.Agents))
 	for code := range sm.registry.Agents {
 		codes = append(codes, code)
 	}
 	sm.mu.RUnlock()
+	sort.Strings(codes)
+	return codes
+}
 
-	for i, code := range codes {
-		if i > 0 && autoConnectStaggerSec > 0 {
-			time.Sleep(time.Duration(autoConnectStaggerSec) * time.Second)
+func (sm *SessionManager) AutoConnectAll() {
+	codes := sm.sortedAgentCodes()
+	started := 0
+	for _, code := range codes {
+		if sm.IsDraining() {
+			return
 		}
 		s, ok := sm.GetSession(code)
 		if !ok {
@@ -407,65 +420,69 @@ func (sm *SessionManager) AutoConnectAll() {
 		if err != nil || deviceStore.ID == nil {
 			continue
 		}
-		fmt.Printf("[SESSIONS] Auto-connecting %s...\n", code)
-		go func(session *AgentSession) {
-			// Reintentos: tras redeploy el WS a veces falla al primer intento
-			var lastErr error
-			for attempt := 1; attempt <= 4; attempt++ {
-				if sm.IsDraining() {
-					return
-				}
-				lastErr = session.connectExisting()
-				if lastErr == nil {
-					return
-				}
-				fmt.Printf("[SESSIONS] Auto-connect %s attempt %d/4 failed: %v\n", session.AgentCode, attempt, lastErr)
-				time.Sleep(time.Duration(attempt*3) * time.Second)
+		if started > 0 && autoConnectStaggerSec > 0 {
+			fmt.Printf("[SESSIONS] Esperando %ds antes de conectar la siguiente línea...\n", autoConnectStaggerSec)
+			time.Sleep(time.Duration(autoConnectStaggerSec) * time.Second)
+			if sm.IsDraining() {
+				return
 			}
-			fmt.Printf("[SESSIONS] Auto-connect %s gave up: %v\n", session.AgentCode, lastErr)
-		}(s)
+		}
+		started++
+		fmt.Printf("[SESSIONS] Auto-connecting %s (%d/%d)...\n", code, started, len(codes))
+		if err := s.connectExisting(); err != nil {
+			s.noteReconnectFailure()
+			fmt.Printf("[SESSIONS] Auto-connect %s failed: %v (próximo reintento con backoff)\n", s.AgentCode, err)
+		}
 	}
 }
 
-// ReconnectDisconnected vuelve a conectar sesiones con device que no estén connected.
-// No toca pairing/QR ni hace logout.
+// ReconnectDisconnected reconecta sesiones con device que quedaron offline.
+// Una por vez, con backoff. No toca pairing/QR ni hace logout.
 func (sm *SessionManager) ReconnectDisconnected() {
 	if sm.IsDraining() {
 		return
 	}
-	sm.mu.RLock()
-	codes := make([]string, 0, len(sm.registry.Agents))
-	for code := range sm.registry.Agents {
-		codes = append(codes, code)
-	}
-	sm.mu.RUnlock()
-
+	codes := sm.sortedAgentCodes()
+	started := 0
 	for _, code := range codes {
+		if sm.IsDraining() {
+			return
+		}
 		s, ok := sm.GetSession(code)
 		if !ok {
 			continue
 		}
-		s.mu.RLock()
-		already := s.connected && s.client != nil
-		s.mu.RUnlock()
-		if already {
+		if !s.shouldAutoReconnectNow() {
 			continue
 		}
 		deviceStore, err := s.container.GetFirstDevice(context.Background())
 		if err != nil || deviceStore.ID == nil {
 			continue
 		}
-		fmt.Printf("[SESSIONS] ReconnectDisconnected %s...\n", code)
-		go func(session *AgentSession) {
-			if err := session.connectExisting(); err != nil {
-				fmt.Printf("[SESSIONS] ReconnectDisconnected %s failed: %v\n", session.AgentCode, err)
+		if started > 0 && autoConnectStaggerSec > 0 {
+			time.Sleep(time.Duration(autoConnectStaggerSec) * time.Second)
+			if sm.IsDraining() {
+				return
 			}
-		}(s)
+			if !s.shouldAutoReconnectNow() {
+				continue
+			}
+		}
+		started++
+		fmt.Printf("[SESSIONS] ReconnectDisconnected %s (intento backoff)...\n", code)
+		if err := s.connectExisting(); err != nil {
+			s.noteReconnectFailure()
+			fmt.Printf("[SESSIONS] ReconnectDisconnected %s failed: %v\n", s.AgentCode, err)
+		}
 	}
 }
 
 func (s *AgentSession) isLoggedInLocked() bool {
 	return s.client != nil && s.client.Store != nil && s.client.Store.ID != nil
+}
+
+func (s *AgentSession) isLiveLocked() bool {
+	return s.client != nil && s.client.IsConnected() && s.isLoggedInLocked()
 }
 
 func (s *AgentSession) StatusInfo() SessionStatusInfo {
@@ -655,14 +672,21 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 	case *events.Disconnected:
 		s.handleDisconnected()
 
+	case *events.StreamReplaced:
+		s.handleStreamReplaced()
+
 	case *events.LoggedOut:
 		s.cancelDisconnectNotify()
 		s.mu.Lock()
 		s.connected = false
+		s.loggedOut = true
+		s.reconnecting = false
+		s.reconnectAttempt = 0
+		s.nextReconnectAt = time.Time{}
 		s.client = nil
 		s.qrCode = ""
 		s.mu.Unlock()
-		fmt.Printf("✗ [%s] WhatsApp logged out\n", s.AgentCode)
+		fmt.Printf("✗ [%s] WhatsApp logged out (sin auto-reconnect)\n", s.AgentCode)
 		if s.manager == nil || !s.manager.IsDraining() {
 			s.dispatchWebhook("session.status", map[string]string{"status": "logged_out"})
 		}
@@ -678,6 +702,29 @@ func (s *AgentSession) cancelDisconnectNotify() {
 	}
 }
 
+func (s *AgentSession) handleStreamReplaced() {
+	if s.manager != nil && s.manager.IsDraining() {
+		s.mu.Lock()
+		s.connected = false
+		s.reconnecting = false
+		s.mu.Unlock()
+		return
+	}
+
+	s.cancelDisconnectNotify()
+	s.mu.Lock()
+	if s.client != nil {
+		s.client.EnableAutoReconnect = false
+	}
+	s.connected = false
+	s.reconnecting = false
+	s.lastDisconnectAt = time.Now()
+	s.nextReconnectAt = time.Now().Add(streamReplacedBackoff)
+	s.mu.Unlock()
+	fmt.Printf("[SESSIONS] %s StreamReplaced: otra conexión tomó el socket. Reintento en %s (sin logout).\n",
+		s.AgentCode, streamReplacedBackoff)
+}
+
 func (s *AgentSession) handleDisconnected() {
 	if s.manager != nil && s.manager.IsDraining() {
 		s.mu.Lock()
@@ -687,7 +734,7 @@ func (s *AgentSession) handleDisconnected() {
 	}
 
 	s.mu.Lock()
-	s.connected = false
+	s.markDisconnectedLocked()
 	s.mu.Unlock()
 
 	delay := time.Duration(sessionStatusDebounceSec) * time.Second
@@ -751,6 +798,8 @@ func (s *AgentSession) handleConnected() {
 		return
 	}
 	s.connected = true
+	s.lastConnectedAt = time.Now()
+	s.resetReconnectStateLocked()
 	s.qrCode = ""
 	phone := s.client.Store.ID.User
 	if s.client != nil {
@@ -781,6 +830,8 @@ func (s *AgentSession) handleConnected() {
 }
 
 func (s *AgentSession) handleReceipt(receipt *events.Receipt) {
+	// Recibos delivered/read son tráfico interno de WhatsApp. Reenviarlos al
+	// dashboard satura Vercel y no alimenta el agente (Agente_IA los ignora).
 	if skipGroupsAndBroadcast && (receipt.IsGroup || !shouldProcessChatJID(receipt.Chat.String())) {
 		return
 	}
@@ -788,21 +839,8 @@ func (s *AgentSession) handleReceipt(receipt *events.Receipt) {
 	if status < 0 {
 		return
 	}
-	chatJID := receipt.Chat.String()
-	for _, msgID := range receipt.MessageIDs {
-		if msgID == "" {
-			continue
-		}
-		logVerbose("[RECEIPT][%s] id=%s chat=%s type=%s status=%d\n", s.AgentCode, msgID, chatJID, receipt.Type, status)
-		s.dispatchWebhook("messages.status", map[string]interface{}{
-			"id":           msgID,
-			"message_id":   msgID,
-			"status":       status,
-			"chat_jid":     chatJID,
-			"timestamp":    receipt.Timestamp.Unix(),
-			"receipt_type": string(receipt.Type),
-		})
-	}
+	logVerbose("[RECEIPT][%s] chat=%s type=%s status=%d (no webhook)\n",
+		s.AgentCode, receipt.Chat.String(), receipt.Type, status)
 }
 
 func (s *AgentSession) appendMessage(msg MessageEvent) {
@@ -819,16 +857,81 @@ func (s *AgentSession) appendMessage(msg MessageEvent) {
 	}
 }
 
+func (s *AgentSession) shouldAutoReconnectNow() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.isLiveLocked() {
+		return false
+	}
+	return !shouldSkipAutoReconnect(s.loggedOut, false, s.reconnecting, time.Now(), s.nextReconnectAt)
+}
+
+func (s *AgentSession) noteReconnectFailure() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reconnectAttempt = reconnectAttemptCapped(s.reconnectAttempt + 1)
+	s.nextReconnectAt = time.Now().Add(reconnectDelayAfterAttempt(s.reconnectAttempt))
+	s.reconnecting = false
+	fmt.Printf("[SESSIONS] %s próximo reintento en %s (intento %d)\n",
+		s.AgentCode, reconnectDelayAfterAttempt(s.reconnectAttempt), s.reconnectAttempt)
+}
+
+func (s *AgentSession) resetReconnectStateLocked() {
+	s.reconnectAttempt = 0
+	s.nextReconnectAt = time.Time{}
+	s.loggedOut = false
+	s.reconnecting = false
+}
+
+func (s *AgentSession) markDisconnectedLocked() {
+	now := time.Now()
+	dur := time.Duration(0)
+	if !s.lastConnectedAt.IsZero() {
+		dur = now.Sub(s.lastConnectedAt)
+	}
+	next, attempt := nextReconnectAtAfterDisconnect(now, s.lastConnectedAt, s.nextReconnectAt, s.reconnectAttempt, dur)
+	s.lastDisconnectAt = now
+	s.reconnectAttempt = attempt
+	s.nextReconnectAt = next
+	s.connected = false
+}
+
 func (s *AgentSession) connectExisting() error {
 	s.mu.Lock()
-	if s.client != nil && s.client.IsConnected() && s.isLoggedInLocked() {
+	if s.loggedOut {
+		s.mu.Unlock()
+		return fmt.Errorf("session logged out; scan QR to login")
+	}
+	if s.isLiveLocked() {
 		s.connected = true
 		s.mu.Unlock()
 		return nil
 	}
+	if s.reconnecting {
+		s.mu.Unlock()
+		return fmt.Errorf("reconnect already in progress")
+	}
 
-	// Websocket muerto / flag stale: limpiar y reconectar con la sesión guardada
+	disconnectAge := time.Duration(0)
+	if !s.lastDisconnectAt.IsZero() {
+		disconnectAge = time.Since(s.lastDisconnectAt)
+	}
+	neverConnected := s.lastConnectedAt.IsZero()
+	clientExists := s.client != nil
+	if !shouldReplaceWhatsAppClient(false, clientExists, neverConnected, disconnectAge) {
+		s.mu.Unlock()
+		return nil
+	}
+
+	s.reconnecting = true
+
 	if s.client != nil {
+		if s.isLiveLocked() {
+			s.reconnecting = false
+			s.connected = true
+			s.mu.Unlock()
+			return nil
+		}
 		s.client.Disconnect()
 		s.client = nil
 		s.connected = false
@@ -837,6 +940,7 @@ func (s *AgentSession) connectExisting() error {
 	clientLog := newClientLogger(s.AgentCode)
 	deviceStore, err := s.container.GetFirstDevice(context.Background())
 	if err != nil {
+		s.reconnecting = false
 		s.mu.Unlock()
 		return err
 	}
@@ -847,18 +951,32 @@ func (s *AgentSession) connectExisting() error {
 	s.client = client
 	s.mu.Unlock()
 
-	return client.Connect()
+	err = client.Connect()
+	if err != nil {
+		s.mu.Lock()
+		s.reconnecting = false
+		s.mu.Unlock()
+	}
+	return err
 }
 
 func (s *AgentSession) Connect() (needsQR bool, err error) {
 	s.mu.Lock()
-	if s.client != nil && s.client.IsConnected() && s.isLoggedInLocked() {
+	if s.isLiveLocked() {
 		s.connected = true
+		s.resetReconnectStateLocked()
 		s.mu.Unlock()
 		return false, nil
 	}
 
-	// Flag "connected" con websocket caído → forzar reconexión real
+	s.resetReconnectStateLocked()
+
+	// Sesión ya vinculada: no cortar el cliente para generar QR.
+	if s.client != nil && s.isLoggedInLocked() {
+		s.mu.Unlock()
+		return false, s.connectExisting()
+	}
+
 	if s.client != nil {
 		s.client.Disconnect()
 		s.client = nil
@@ -958,20 +1076,44 @@ func (s *AgentSession) Client() (*whatsmeow.Client, bool) {
 	return s.client, true
 }
 
-// EnsureConnected reconecta si hay sesión guardada pero el websocket está caído.
+// EnsureConnected espera la reconexión automática. No hace login nuevo en cada envío.
 func (s *AgentSession) EnsureConnected() error {
 	if _, ok := s.Client(); ok {
 		return nil
 	}
-	_, err := s.Connect()
-	if err != nil {
-		return err
+
+	s.mu.RLock()
+	loggedOut := s.loggedOut
+	nextAt := s.nextReconnectAt
+	s.mu.RUnlock()
+	if loggedOut {
+		return fmt.Errorf("session logged out")
 	}
-	for i := 0; i < 15; i++ {
+
+	deadline := time.Now().Add(ensureConnectedWait)
+	for time.Now().Before(deadline) {
 		if _, ok := s.Client(); ok {
 			return nil
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(ensureConnectedStep)
+	}
+	if _, ok := s.Client(); ok {
+		return nil
+	}
+
+	if !nextAt.IsZero() && time.Now().Before(nextAt) {
+		return fmt.Errorf("websocket not connected; reconnect scheduled in %s", time.Until(nextAt).Round(time.Second))
+	}
+
+	if err := s.connectExisting(); err != nil {
+		return err
+	}
+	waitDeadline := time.Now().Add(ensureConnectedWait)
+	for time.Now().Before(waitDeadline) {
+		if _, ok := s.Client(); ok {
+			return nil
+		}
+		time.Sleep(ensureConnectedStep)
 	}
 	if _, ok := s.Client(); ok {
 		return nil
@@ -1779,22 +1921,8 @@ func (s *AgentSession) handleUndecryptableMessage(evt *events.UndecryptableMessa
 		logVerbose("[UNDECRYPTABLE-RETRY][%s] id=%s pn=%s\n", s.AgentCode, evt.Info.ID, senderPN)
 	}
 
-	// whatsmeow ya envía retry receipts; avisamos al CRM para chats 1:1 con teléfono resuelto.
-	if senderPN != "" {
-		s.dispatchWebhook("messages.undecryptable", map[string]interface{}{
-			"id":               evt.Info.ID,
-			"message_id":       evt.Info.ID,
-			"from":             evt.Info.Sender.String(),
-			"chat_jid":         chatJID,
-			"sender_pn":        senderPN,
-			"sender_lid":       senderLID,
-			"push_name":        evt.Info.PushName,
-			"timestamp":        evt.Info.Timestamp.Unix(),
-			"is_unavailable":   evt.IsUnavailable,
-			"unavailable_type": string(evt.UnavailableType),
-			"is_from_me":       evt.Info.IsFromMe,
-		})
-	}
+	// whatsmeow ya envía retry receipts. No reenviar al dashboard.
+	return
 }
 
 func (s *AgentSession) handleReactionMessage(info types.MessageInfo, rm *waE2E.ReactionMessage) {
@@ -1804,18 +1932,6 @@ func (s *AgentSession) handleReactionMessage(info types.MessageInfo, rm *waE2E.R
 	}
 	fromPhone := s.senderPhone(info)
 	logVerbose("[REACTION][%s] target=%s emoji=%q from=%s\n", s.AgentCode, targetID, rm.GetText(), fromPhone)
-	s.dispatchWebhook("messages.reaction", map[string]interface{}{
-		"reaction_target_id": targetID,
-		"target_id":          targetID,
-		"id":                 targetID,
-		"emoji":              rm.GetText(),
-		"body":               rm.GetText(),
-		"from_phone":         fromPhone,
-		"sender_pn":          fromPhone,
-		"is_from_me":         info.IsFromMe,
-		"chat_jid":           info.Chat.String(),
-		"timestamp":          info.Timestamp.Unix(),
-	})
 }
 
 func (s *AgentSession) handleEncReaction(evt *events.Message) {
@@ -1841,24 +1957,8 @@ func (s *AgentSession) handleProtocolMessage(info types.MessageInfo, pm *waE2E.P
 	switch pm.GetType() {
 	case waE2E.ProtocolMessage_REVOKE:
 		logVerbose("[REVOKE][%s] id=%s chat=%s\n", s.AgentCode, targetID, info.Chat.String())
-		s.dispatchWebhook("messages.deleted", map[string]interface{}{
-			"id":         targetID,
-			"message_id": targetID,
-			"chat_jid":   info.Chat.String(),
-			"timestamp":  info.Timestamp.Unix(),
-			"is_from_me": info.IsFromMe,
-		})
 	case waE2E.ProtocolMessage_MESSAGE_EDIT:
 		newBody := extractTextFromMessage(pm.GetEditedMessage())
 		logVerbose("[EDIT][%s] id=%s body=%q\n", s.AgentCode, targetID, newBody)
-		s.dispatchWebhook("messages.edit", map[string]interface{}{
-			"id":         targetID,
-			"message_id": targetID,
-			"body":       newBody,
-			"content":    newBody,
-			"chat_jid":   info.Chat.String(),
-			"timestamp":  info.Timestamp.Unix(),
-			"is_from_me": info.IsFromMe,
-		})
 	}
 }

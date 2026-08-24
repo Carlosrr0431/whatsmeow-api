@@ -27,7 +27,9 @@ Variables opcionales para reducir memoria, CPU y egress:
 | `VERBOSE_LOGS` | `false` | Logs detallados por mensaje (activar solo para debug) |
 | `CLIENT_LOG_LEVEL` | `ERROR` (o `WARN` si `VERBOSE_LOGS=true`) | Nivel de logs internos de whatsmeow por sesión |
 | `SQLITE_BUSY_TIMEOUT_MS` | `15000` | Espera ante `database is locked` (multi-sesión en un solo volumen) |
-| `AUTO_CONNECT_STAGGER_SEC` | `3` | Segundos entre reconexiones al arrancar (evita picos de SQLite) |
+| `AUTO_CONNECT_STAGGER_SEC` | `20` | Segundos entre el login de cada línea al arrancar. No conecta todas a la vez. |
+| `AUTO_CONNECT_DELAY_SEC` | `5` | Espera inicial antes del primer auto-connect |
+| `RECONNECT_WATCH_SEC` | `15` | Cada cuánto se revisan líneas caídas. **No desconecta sesiones con websocket vivo.** |
 | `SESSION_STATUS_DEBOUNCE_SEC` | `15` | Espera antes de avisar `disconnected` al CRM (ignora cortes EOF breves) |
 | `GOGC` | `80` | GC más frecuente → menos picos de RAM |
 
@@ -43,7 +45,7 @@ Si tenías `AGENT_CODE` + `WEBHOOK_URL` en Railway y un `whatsapp.db` legacy en 
 - SQLite por agente: `/app/data/sessions/{agent_code}/whatsapp.db`
 - Al reiniciar, reconecta todas las sesiones registradas
 - Cada evento se envía al webhook configurado para ese `agent_code`
-- Eventos principales: `messages.upsert`, `messages.button` (botones), `messages.list` (lista sendList), `messages.status`, `messages.reaction`, `messages.deleted`, `messages.edit`, `session.status`
+- Eventos que se reenvían al CRM: `messages.upsert`, `messages.button`, `messages.list`, `messages.poll`, `session.status`. Los recibos (`messages.status`) y edits no se reenvían.
 
 ## Endpoints
 
