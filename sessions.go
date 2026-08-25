@@ -842,7 +842,7 @@ func (s *AgentSession) handleConnected() {
 	// que la sesión sea marcada como inactiva o sospechosa.
 	go func() {
 		if localClient != nil {
-			_ = localClient.SendPresence(types.PresenceAvailable)
+			_ = localClient.SendPresence(context.Background(), types.PresenceAvailable)
 		}
 	}()
 
