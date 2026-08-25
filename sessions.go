@@ -834,17 +834,7 @@ func (s *AgentSession) handleConnected() {
 	if s.client != nil {
 		s.client.AutoReconnectErrors = 0
 	}
-	localClient := s.client
 	s.mu.Unlock()
-
-	// Señalizar al servidor de WhatsApp que el cliente está disponible.
-	// Esto es importante para el cumplimiento de políticas de Meta y evitar
-	// que la sesión sea marcada como inactiva o sospechosa.
-	go func() {
-		if localClient != nil {
-			_ = localClient.SendPresence(context.Background(), types.PresenceAvailable)
-		}
-	}()
 
 	if notified {
 		fmt.Printf("✓ [%s] WhatsApp connected (%s)\n", s.AgentCode, phone)
