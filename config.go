@@ -20,6 +20,15 @@ var (
 	reconnectWatchSec        int
 	shutdownWaitSec          int
 	sessionStatusDebounceSec int
+
+	// Pausa de escritura antes de enviar mensajes (cumplimiento políticas Meta).
+	sendMinDelayMs int
+	sendMaxDelayMs int
+	sendJitterMs   int
+
+	// Reintento de webhook ante errores 5xx.
+	webhookRetryMax     int
+	webhookRetryDelayMs int
 )
 
 func initRuntimeConfig() {
@@ -33,6 +42,11 @@ func initRuntimeConfig() {
 	reconnectWatchSec = envInt("RECONNECT_WATCH_SEC", 15)
 	shutdownWaitSec = envInt("SHUTDOWN_WAIT_SEC", 2)
 	sessionStatusDebounceSec = envInt("SESSION_STATUS_DEBOUNCE_SEC", 15)
+	sendMinDelayMs = envInt("SEND_MIN_DELAY_MS", 800)
+	sendMaxDelayMs = envInt("SEND_MAX_DELAY_MS", 3500)
+	sendJitterMs = envInt("SEND_JITTER_MS", 400)
+	webhookRetryMax = envInt("WEBHOOK_RETRY_MAX", 2)
+	webhookRetryDelayMs = envInt("WEBHOOK_RETRY_DELAY_MS", 1500)
 	clientLogLevel = strings.TrimSpace(strings.ToUpper(os.Getenv("CLIENT_LOG_LEVEL")))
 	if clientLogLevel == "" {
 		if verboseLogs {

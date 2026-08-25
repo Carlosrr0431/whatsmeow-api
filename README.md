@@ -33,6 +33,25 @@ Variables opcionales para reducir memoria, CPU y egress:
 | `SESSION_STATUS_DEBOUNCE_SEC` | `15` | Espera antes de avisar `disconnected` al CRM (ignora cortes EOF breves) |
 | `GOGC` | `80` | GC más frecuente → menos picos de RAM |
 
+### Cumplimiento de políticas Meta / anti-bloqueo
+
+Variables para ajustar el comportamiento de envío y reducir el riesgo de bloqueo:
+
+| Variable | Default | Descripción |
+|----------|---------|-------------|
+| `SEND_MIN_DELAY_MS` | `800` | Mínimo de tiempo "escribiendo" antes de enviar cada mensaje (ms) |
+| `SEND_MAX_DELAY_MS` | `3500` | Máximo de tiempo "escribiendo" (ms). Se escala con el largo del texto. |
+| `SEND_JITTER_MS` | `400` | Variación aleatoria adicional en el delay de escritura (ms). Hace el envío más humano. |
+| `WEBHOOK_RETRY_MAX` | `2` | Reintentos del webhook ante errores HTTP 5xx del servidor destino |
+| `WEBHOOK_RETRY_DELAY_MS` | `1500` | Espera entre reintentos de webhook (ms) |
+
+> **Cómo funciona el delay de escritura:**  
+> Antes de enviar, el servidor simula que el agente está escribiendo (`ChatPresenceComposing`).  
+> La duración es `base + jitter` donde `base = SEND_MIN_DELAY_MS + largo_del_texto × 20ms`  
+> y `jitter` es un valor aleatorio entre 0 y `SEND_JITTER_MS`.  
+> El resultado se acota a `[SEND_MIN_DELAY_MS, SEND_MAX_DELAY_MS]`.  
+> Además, al conectar, el servidor envía `PresenceAvailable` para indicar al servidor de WhatsApp que el cliente está activo.
+
 **Ya no uses** `AGENT_CODE` ni `WEBHOOK_URL` fijos. Cada agente se registra vía `POST /api/webhook/config` con su `agent_code` y `webhook_url` (lo hace el dashboard al guardar el agente).
 
 ### Migración desde servidor monolítico

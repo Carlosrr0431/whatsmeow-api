@@ -95,8 +95,9 @@ type SessionManager struct {
 
 func NewSessionManager(dataDir, defaultSecret string) (*SessionManager, error) {
 	initRuntimeConfig()
-	fmt.Printf("[CONFIG] max_msg_history=%d max_raw_media=%d skip_groups=%v client_log=%s sqlite_busy_ms=%d connect_stagger_sec=%d connect_delay_sec=%d reconnect_watch_sec=%d shutdown_wait_sec=%d status_debounce_sec=%d\n",
-		maxMsgHistLimit, maxRawMediaLimit, skipGroupsAndBroadcast, clientLogLevel, sqliteBusyTimeoutMS, autoConnectStaggerSec, autoConnectDelaySec, reconnectWatchSec, shutdownWaitSec, sessionStatusDebounceSec)
+	fmt.Printf("[CONFIG] max_msg_history=%d max_raw_media=%d skip_groups=%v client_log=%s sqlite_busy_ms=%d connect_stagger_sec=%d connect_delay_sec=%d reconnect_watch_sec=%d shutdown_wait_sec=%d status_debounce_sec=%d send_delay=%d-%dms jitter=%dms webhook_retry=%d/%dms\n",
+		maxMsgHistLimit, maxRawMediaLimit, skipGroupsAndBroadcast, clientLogLevel, sqliteBusyTimeoutMS, autoConnectStaggerSec, autoConnectDelaySec, reconnectWatchSec, shutdownWaitSec, sessionStatusDebounceSec,
+		sendMinDelayMs, sendMaxDelayMs, sendJitterMs, webhookRetryMax, webhookRetryDelayMs)
 
 	if dataDir == "" {
 		dataDir = "/app/data"
@@ -550,42 +551,70 @@ func (s *AgentSession) dispatchWebhook(event string, data interface{}) {
 			return
 		}
 
-		req, err := http.NewRequest("POST", url, bytes.NewReader(payload))
-		if err != nil {
-			return
+		maxRetries := webhookRetryMax
+		if maxRetries < 0 {
+			maxRetries = 0
 		}
-		req.Header.Set("Content-Type", "application/json; charset=utf-8")
-		if secret != "" {
-			req.Header.Set("X-Webhook-Secret", secret)
+		retryDelayMs := webhookRetryDelayMs
+		if retryDelayMs < 0 {
+			retryDelayMs = 0
 		}
 
-		resp, err := client.Do(req)
-		if err != nil {
-			fmt.Printf("[WEBHOOK] %s %s → error: %v\n", agentCode, event, err)
-			return
-		}
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			fmt.Printf("[WEBHOOK] %s %s → %s: HTTP %d %s\n", agentCode, event, url, resp.StatusCode, strings.TrimSpace(string(body)))
-			return
-		}
-		if event == "messages.upsert" {
-			fmt.Printf("[WEBHOOK] %s messages.upsert → OK\n", agentCode)
-		} else if event == "messages.button" || event == "messages.list" {
-			if msg, ok := data.(MessageEvent); ok {
-				fmt.Printf("[WEBHOOK] %s %s id=%s button_id=%s → OK\n", agentCode, event, msg.ID, msg.ButtonID)
-			} else {
-				fmt.Printf("[WEBHOOK] %s %s → OK\n", agentCode, event)
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			if attempt > 0 {
+				time.Sleep(time.Duration(retryDelayMs) * time.Millisecond)
 			}
-		} else if event == "messages.status" {
-			if dataMap, ok := data.(map[string]interface{}); ok {
-				fmt.Printf("[WEBHOOK] %s messages.status id=%v status=%v → OK\n", agentCode, dataMap["id"], dataMap["status"])
-			} else {
-				fmt.Printf("[WEBHOOK] %s messages.status → OK\n", agentCode)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(payload))
+			if err != nil {
+				cancel()
+				return
 			}
-		} else {
-			logVerbose("[WEBHOOK] %s %s → %s: %d\n", agentCode, event, url, resp.StatusCode)
+			req.Header.Set("Content-Type", "application/json; charset=utf-8")
+			if secret != "" {
+				req.Header.Set("X-Webhook-Secret", secret)
+			}
+
+			resp, err := client.Do(req)
+			cancel()
+			if err != nil {
+				if attempt < maxRetries {
+					fmt.Printf("[WEBHOOK] %s %s → error (reintento %d/%d): %v\n", agentCode, event, attempt+1, maxRetries, err)
+					continue
+				}
+				fmt.Printf("[WEBHOOK] %s %s → error: %v\n", agentCode, event, err)
+				return
+			}
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			resp.Body.Close()
+
+			if resp.StatusCode >= 500 && attempt < maxRetries {
+				fmt.Printf("[WEBHOOK] %s %s → HTTP %d (reintento %d/%d)\n", agentCode, event, resp.StatusCode, attempt+1, maxRetries)
+				continue
+			}
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				fmt.Printf("[WEBHOOK] %s %s → %s: HTTP %d %s\n", agentCode, event, url, resp.StatusCode, strings.TrimSpace(string(body)))
+				return
+			}
+			if event == "messages.upsert" {
+				fmt.Printf("[WEBHOOK] %s messages.upsert → OK\n", agentCode)
+			} else if event == "messages.button" || event == "messages.list" {
+				if msg, ok := data.(MessageEvent); ok {
+					fmt.Printf("[WEBHOOK] %s %s id=%s button_id=%s → OK\n", agentCode, event, msg.ID, msg.ButtonID)
+				} else {
+					fmt.Printf("[WEBHOOK] %s %s → OK\n", agentCode, event)
+				}
+			} else if event == "messages.status" {
+				if dataMap, ok := data.(map[string]interface{}); ok {
+					fmt.Printf("[WEBHOOK] %s messages.status id=%v status=%v → OK\n", agentCode, dataMap["id"], dataMap["status"])
+				} else {
+					fmt.Printf("[WEBHOOK] %s messages.status → OK\n", agentCode)
+				}
+			} else {
+				logVerbose("[WEBHOOK] %s %s → %s: %d\n", agentCode, event, url, resp.StatusCode)
+			}
+			return
 		}
 	}()
 }
@@ -805,7 +834,17 @@ func (s *AgentSession) handleConnected() {
 	if s.client != nil {
 		s.client.AutoReconnectErrors = 0
 	}
+	localClient := s.client
 	s.mu.Unlock()
+
+	// Señalizar al servidor de WhatsApp que el cliente está disponible.
+	// Esto es importante para el cumplimiento de políticas de Meta y evitar
+	// que la sesión sea marcada como inactiva o sospechosa.
+	go func() {
+		if localClient != nil {
+			_ = localClient.SendPresence(types.PresenceAvailable)
+		}
+	}()
 
 	if notified {
 		fmt.Printf("✓ [%s] WhatsApp connected (%s)\n", s.AgentCode, phone)

@@ -10,11 +10,12 @@ RUN go get go.mau.fi/whatsmeow@latest && \
     go get github.com/mattn/go-sqlite3@latest && \
     go get github.com/skip2/go-qrcode@latest && \
     go get google.golang.org/protobuf@latest && \
-    go mod tidy
+    go mod tidy && \
+    go mod download
 
-RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o whatsmeow-api .
+RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -ldflags="-s -w" -o whatsmeow-api .
 
-FROM alpine:3.19
+FROM alpine:3.20
 
 RUN apk add --no-cache ca-certificates sqlite-libs tzdata
 

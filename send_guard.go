@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,8 +20,6 @@ const (
 	jidPositiveTTL    = 24 * time.Hour
 	jidNegativeTTL    = 30 * time.Minute
 	onWAMinInterval   = 8 * time.Second
-	typingMinDelay    = 700 * time.Millisecond
-	typingMaxDelay    = 2200 * time.Millisecond
 	typingPollDelay   = 800 * time.Millisecond
 )
 
@@ -328,9 +327,25 @@ func (s *AgentSession) resolveSendJID(client *whatsmeow.Client, phone string) ty
 	return resolveSendJIDCached(s, client, phone)
 }
 
+// typingDelayForMessage calcula cuánto tiempo "escribir" antes de enviar.
+// Usa el largo del texto como base y agrega jitter aleatorio para parecer
+// más humano y reducir riesgo de bloqueo por Meta.
 func typingDelayForMessage(msg *waE2E.Message) time.Duration {
+	minMs := sendMinDelayMs
+	maxMs := sendMaxDelayMs
+	if minMs <= 0 {
+		minMs = 800
+	}
+	if maxMs <= 0 || maxMs < minMs {
+		maxMs = minMs + 2700
+	}
+	jitterRange := sendJitterMs
+	if jitterRange < 0 {
+		jitterRange = 0
+	}
+
 	if msg == nil {
-		return typingMinDelay
+		return withJitter(minMs, jitterRange, maxMs)
 	}
 	if msg.GetPollCreationMessage() != nil {
 		return typingPollDelay
@@ -342,18 +357,23 @@ func typingDelayForMessage(msg *waE2E.Message) time.Duration {
 		}
 	}
 	if text == "" {
-		return typingMinDelay
+		return withJitter(minMs, jitterRange, maxMs)
 	}
 	n := utf8.RuneCountInString(text)
-	ms := 700 + n*22
-	d := time.Duration(ms) * time.Millisecond
-	if d < typingMinDelay {
-		return typingMinDelay
+	baseMs := minMs + n*20
+	return withJitter(baseMs, jitterRange, maxMs)
+}
+
+// withJitter suma un valor aleatorio [0, jitterRange] al base y acota al máximo.
+func withJitter(baseMs, jitterRange, maxMs int) time.Duration {
+	ms := baseMs
+	if jitterRange > 0 {
+		ms += rand.Intn(jitterRange + 1)
 	}
-	if d > typingMaxDelay {
-		return typingMaxDelay
+	if ms > maxMs {
+		ms = maxMs
 	}
-	return d
+	return time.Duration(ms) * time.Millisecond
 }
 
 func (s *AgentSession) sendWithHumanPacing(
