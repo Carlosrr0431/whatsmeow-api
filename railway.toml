@@ -8,6 +8,11 @@ healthcheckPath = "/health"
 healthcheckTimeout = 60
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 5
+# Volumen en /app/data: Railway no corre dos réplicas a la vez.
+# overlap 0 + draining: SIGTERM → Disconnect (no Logout) y flush de sqlite
+# antes del SIGKILL. Las sesiones se reconectan solas al arrancar.
+overlapSeconds = 0
+drainingSeconds = 25
 
 [deploy.env]
 SKIP_GROUPS = "true"
