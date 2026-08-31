@@ -272,7 +272,7 @@ func (s *AgentSession) allowOnWhatsAppQuery() bool {
 
 // resolveSendJIDCached evita IsOnWhatsApp en cada envío: usa JID de chats
 // entrantes / envíos previos. IsOnWhatsApp es la consulta que más bloqueos genera.
-func resolveSendJIDCached(s *AgentSession, client *whatsmeow.Client, phone string) types.JID {
+func resolveSendJIDCached(s *AgentSession, _ *whatsmeow.Client, phone string) types.JID {
 	phone = strings.TrimSpace(phone)
 	if phone == "" {
 		return types.EmptyJID
@@ -291,31 +291,16 @@ func resolveSendJIDCached(s *AgentSession, client *whatsmeow.Client, phone strin
 	}
 
 	digits := digitsOnlyPhone(phone)
-	if cached, ok, missing := s.lookupPeerJID(digits); missing {
-		return parseJID(digits)
-	} else if ok {
-		return cached
-	}
-
-	if client != nil && s.allowOnWhatsAppQuery() {
-		resp, err := client.IsOnWhatsApp(context.Background(), []string{digits})
-		if err == nil && len(resp) > 0 {
-			if resp[0].IsIn {
-				jid := resp[0].JID.ToNonAD()
-				if jid.Server == types.HiddenUserServer {
-					jid = normalizeLIDJID(jid)
-				}
-				if s != nil {
-					s.rememberPeerJID(digits, jid)
-				}
-				return jid
-			}
-			if s != nil {
-				s.rememberMissingPhone(digits)
-			}
+	if s != nil {
+		if cached, ok, missing := s.lookupPeerJID(digits); missing {
+			return parseJID(digits)
+		} else if ok {
+			return cached
 		}
 	}
 
+	// Nunca IsOnWhatsApp en el send: Meta lo usa para detectar scrapers y banea
+	// la sesión. El JID se arma con el número; el cache se llena con chats entrantes.
 	return parseJID(digits)
 }
 
