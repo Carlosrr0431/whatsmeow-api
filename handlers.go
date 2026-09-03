@@ -774,6 +774,75 @@ func (app *App) handleDownloadMedia(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
+func profilePictureHidden(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "hidden their profile picture")
+}
+
+func addProfilePicJID(list *[]types.JID, seen map[string]bool, jid types.JID) {
+	if jid.IsEmpty() {
+		return
+	}
+	if jid.Server == types.HiddenUserServer {
+		jid = normalizeLIDJID(jid)
+	}
+	key := jid.String()
+	if seen[key] {
+		return
+	}
+	seen[key] = true
+	*list = append(*list, jid)
+}
+
+func altProfilePicJID(client *whatsmeow.Client, ctx context.Context, jid types.JID) types.JID {
+	if client == nil || client.Store == nil || client.Store.LIDs == nil || jid.IsEmpty() {
+		return types.EmptyJID
+	}
+	alt, err := client.Store.GetAltJID(ctx, jid)
+	if err != nil || alt.IsEmpty() {
+		return types.EmptyJID
+	}
+	return alt
+}
+
+func fetchProfilePicture(client *whatsmeow.Client, phone, lid string) (*types.ProfilePictureInfo, string, bool, error) {
+	ctx := context.Background()
+	var candidates []types.JID
+	seen := map[string]bool{}
+
+	// LID primero: el tctoken de privacidad vive en el JID @lid, no en @s.whatsapp.net.
+	if strings.TrimSpace(lid) != "" {
+		lidUser := strings.TrimSuffix(strings.TrimSuffix(strings.TrimSpace(lid), "@lid"), "@")
+		lidUser = stripDeviceFromUser(lidUser)
+		lidJID := types.NewJID(lidUser, types.HiddenUserServer)
+		addProfilePicJID(&candidates, seen, lidJID)
+		addProfilePicJID(&candidates, seen, altProfilePicJID(client, ctx, lidJID))
+	}
+
+	if strings.TrimSpace(phone) != "" {
+		pn := parseJID(phone)
+		addProfilePicJID(&candidates, seen, altProfilePicJID(client, ctx, pn))
+		addProfilePicJID(&candidates, seen, pn)
+	}
+
+	var lastErr error
+	for _, jid := range candidates {
+		for _, preview := range []bool{false, true} {
+			pic, err := client.GetProfilePictureInfo(ctx, jid, &whatsmeow.GetProfilePictureParams{Preview: preview})
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			if pic != nil && strings.TrimSpace(pic.URL) != "" {
+				return pic, jid.String(), preview, nil
+			}
+		}
+	}
+	return nil, "", false, lastErr
+}
+
 func (app *App) handleGetProfilePic(w http.ResponseWriter, r *http.Request) {
 	code, ok := requireAgentCode(w, r)
 	if !ok {
@@ -784,27 +853,46 @@ func (app *App) handleGetProfilePic(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Message: "Session not found"})
 		return
 	}
-	client, connected := s.Client()
-	if !connected {
-		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WhatsApp not connected"})
+	client, okClient := app.clientReadyForSend(w, s)
+	if !okClient {
 		return
 	}
-	phone := r.URL.Query().Get("phone")
-	if phone == "" {
-		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "phone parameter is required"})
+	phone := strings.TrimSpace(r.URL.Query().Get("phone"))
+	lid := strings.TrimSpace(r.URL.Query().Get("lid"))
+	if phone == "" && lid == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "phone or lid parameter is required"})
 		return
 	}
-	jid := parseJID(phone)
-	pic, err := client.GetProfilePictureInfo(context.Background(), jid, &whatsmeow.GetProfilePictureParams{})
+
+	pic, jidUsed, preview, err := fetchProfilePicture(client, phone, lid)
+	if pic != nil && strings.TrimSpace(pic.URL) != "" {
+		fmt.Printf("[PROFILE-PIC][%s] ok phone=%s lid=%s jid=%s preview=%v\n", code, phone, lid, jidUsed, preview)
+		writeJSON(w, http.StatusOK, APIResponse{
+			Success: true,
+			Data: map[string]interface{}{
+				"url":     pic.URL,
+				"id":      pic.ID,
+				"jid":     jidUsed,
+				"preview": preview,
+			},
+		})
+		return
+	}
+
+	msg := "profile picture not available"
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, APIResponse{Success: false, Message: err.Error()})
-		return
+		msg = err.Error()
 	}
-	if pic == nil {
-		writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"url": ""}})
-		return
-	}
-	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"url": pic.URL, "id": pic.ID}})
+	hidden := profilePictureHidden(err)
+	fmt.Printf("[PROFILE-PIC][%s] miss phone=%s lid=%s hidden=%v err=%s\n", code, phone, lid, hidden, msg)
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: false,
+		Message: msg,
+		Data: map[string]interface{}{
+			"url":    "",
+			"hidden": hidden,
+		},
+	})
 }
 
 func (app *App) handleCheckNumber(w http.ResponseWriter, r *http.Request) {
