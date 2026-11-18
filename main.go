@@ -25,6 +25,7 @@ type MessageEvent struct {
 	IsGroup       bool   `json:"is_group"`
 	IsFromMe      bool   `json:"is_from_me"`
 	PushName      string `json:"push_name"`
+	FullName      string `json:"full_name"`
 	ChatJID       string `json:"chat_jid"`
 	SenderPN      string `json:"sender_pn,omitempty"`
 	SenderLID     string `json:"sender_lid,omitempty"`

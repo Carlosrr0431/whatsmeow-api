@@ -755,11 +755,12 @@ func (app *App) handleGetContacts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type ContactInfo struct {
-		JID      string `json:"jid"`
-		Name     string `json:"name"`
-		FullName string `json:"full_name"`
-		Phone    string `json:"phone"`
-		LID      string `json:"lid,omitempty"`
+		JID       string `json:"jid"`
+		Name      string `json:"name"`
+		FullName  string `json:"full_name"`
+		FirstName string `json:"first_name,omitempty"`
+		Phone     string `json:"phone"`
+		LID       string `json:"lid,omitempty"`
 	}
 
 	contactList := make([]ContactInfo, 0, len(contacts))
@@ -782,7 +783,12 @@ func (app *App) handleGetContacts(w http.ResponseWriter, r *http.Request) {
 			seenPhones[phone] = true
 		}
 		contactList = append(contactList, ContactInfo{
-			JID: displayJID, Name: info.PushName, FullName: info.FullName, Phone: phone, LID: lid,
+			JID:       displayJID,
+			Name:      strings.TrimSpace(info.PushName),
+			FullName:  strings.TrimSpace(info.FullName),
+			FirstName: strings.TrimSpace(info.FirstName),
+			Phone:     phone,
+			LID:       lid,
 		})
 	}
 	writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: map[string]interface{}{"contacts": contactList, "total": len(contactList)}})

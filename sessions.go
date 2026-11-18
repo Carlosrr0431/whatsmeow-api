@@ -1617,6 +1617,75 @@ func (s *AgentSession) enrichJIDs(info types.MessageInfo) (chatJID, senderPN, se
 	return chatJID, senderPN, senderLID
 }
 
+func savedContactName(info types.ContactInfo) string {
+	if !info.Found {
+		return ""
+	}
+	name := strings.TrimSpace(info.FullName)
+	if name == "" {
+		name = strings.TrimSpace(info.FirstName)
+	}
+	return name
+}
+
+func (s *AgentSession) lookupSavedName(jids []types.JID) string {
+	s.mu.RLock()
+	client := s.client
+	s.mu.RUnlock()
+	if client == nil || client.Store == nil || client.Store.Contacts == nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for _, jid := range jids {
+		if jid.IsEmpty() || jid.Server == types.GroupServer || jid.Server == types.BroadcastServer {
+			continue
+		}
+		contact, err := client.Store.Contacts.GetContact(ctx, jid.ToNonAD())
+		if err != nil {
+			continue
+		}
+		if name := savedContactName(contact); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+func (s *AgentSession) savedNameForMessage(info types.MessageInfo, senderPN, senderLID string) string {
+	if info.IsGroup {
+		return ""
+	}
+	jids := make([]types.JID, 0, 4)
+	add := func(j types.JID) {
+		if j.IsEmpty() || j.Server == types.GroupServer || j.Server == types.BroadcastServer {
+			return
+		}
+		j = j.ToNonAD()
+		for _, existing := range jids {
+			if existing == j {
+				return
+			}
+		}
+		jids = append(jids, j)
+	}
+	if info.IsFromMe {
+		add(info.Chat)
+	} else {
+		add(info.Sender)
+		add(info.Chat)
+	}
+	phone := strings.TrimPrefix(strings.TrimSpace(senderPN), "+")
+	if phone != "" {
+		add(types.NewJID(phone, types.DefaultUserServer))
+	}
+	lid := strings.TrimSuffix(strings.TrimSpace(senderLID), "@lid")
+	if lid != "" {
+		add(types.NewJID(lid, types.HiddenUserServer))
+	}
+	return s.lookupSavedName(jids)
+}
+
 func (s *AgentSession) messageFromEvent(info types.MessageInfo, message *waE2E.Message) MessageEvent {
 	chatJID, senderPN, senderLID := s.enrichJIDs(info)
 
@@ -1631,6 +1700,7 @@ func (s *AgentSession) messageFromEvent(info types.MessageInfo, message *waE2E.M
 		IsGroup:   info.IsGroup,
 		IsFromMe:  info.IsFromMe,
 		PushName:  info.PushName,
+		FullName:  s.savedNameForMessage(info, senderPN, senderLID),
 	}
 	extractMessageContent(message, &msg)
 	if msg.Type == "" {
