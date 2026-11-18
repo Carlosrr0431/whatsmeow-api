@@ -956,7 +956,46 @@ func profilePictureHidden(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "hidden their profile picture")
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "hidden their profile picture") || strings.Contains(msg, "not-authorized")
+}
+
+func profilePictureAbsent(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "does not have a profile picture") || strings.Contains(msg, "profile picture not set")
+}
+
+func downloadProfileBytes(ctx context.Context, rawURL string) ([]byte, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("Accept", "image/jpeg,image/png,image/webp,image/*;q=0.8")
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("descarga de foto %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, "", err
+	}
+	if len(data) < 32 {
+		return nil, "", fmt.Errorf("foto vacía")
+	}
+	mime := strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0])
+	if mime == "" || mime == "application/octet-stream" || !strings.HasPrefix(mime, "image/") {
+		mime = http.DetectContentType(data)
+	}
+	return data, mime, nil
 }
 
 func addProfilePicJID(list *[]types.JID, seen map[string]bool, jid types.JID) {
@@ -1044,16 +1083,23 @@ func (app *App) handleGetProfilePic(w http.ResponseWriter, r *http.Request) {
 
 	pic, jidUsed, preview, err := fetchProfilePicture(client, phone, lid)
 	if pic != nil && strings.TrimSpace(pic.URL) != "" {
-		fmt.Printf("[PROFILE-PIC][%s] ok phone=%s lid=%s jid=%s preview=%v\n", code, phone, lid, jidUsed, preview)
-		writeJSON(w, http.StatusOK, APIResponse{
-			Success: true,
-			Data: map[string]interface{}{
-				"url":     pic.URL,
-				"id":      pic.ID,
-				"jid":     jidUsed,
-				"preview": preview,
-			},
-		})
+		data := map[string]interface{}{
+			"url":     pic.URL,
+			"id":      pic.ID,
+			"jid":     jidUsed,
+			"preview": preview,
+		}
+		dlCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		img, mime, dlErr := downloadProfileBytes(dlCtx, pic.URL)
+		cancel()
+		if dlErr == nil {
+			data["image_base64"] = base64.StdEncoding.EncodeToString(img)
+			data["mime"] = mime
+			fmt.Printf("[PROFILE-PIC][%s] ok phone=%s lid=%s jid=%s preview=%v bytes=%d\n", code, phone, lid, jidUsed, preview, len(img))
+		} else {
+			fmt.Printf("[PROFILE-PIC][%s] url ok, descarga falló phone=%s lid=%s: %v\n", code, phone, lid, dlErr)
+		}
+		writeJSON(w, http.StatusOK, APIResponse{Success: true, Data: data})
 		return
 	}
 
@@ -1062,13 +1108,15 @@ func (app *App) handleGetProfilePic(w http.ResponseWriter, r *http.Request) {
 		msg = err.Error()
 	}
 	hidden := profilePictureHidden(err)
-	fmt.Printf("[PROFILE-PIC][%s] miss phone=%s lid=%s hidden=%v err=%s\n", code, phone, lid, hidden, msg)
+	absent := profilePictureAbsent(err)
+	fmt.Printf("[PROFILE-PIC][%s] miss phone=%s lid=%s hidden=%v absent=%v err=%s\n", code, phone, lid, hidden, absent, msg)
 	writeJSON(w, http.StatusOK, APIResponse{
 		Success: false,
 		Message: msg,
 		Data: map[string]interface{}{
 			"url":    "",
 			"hidden": hidden,
+			"absent": absent,
 		},
 	})
 }
