@@ -163,6 +163,8 @@ func main() {
 					"/api/status?agent_code=AGENT",
 					"/api/session/connect",
 					"/api/session/qr?agent_code=AGENT",
+					"/api/session/passkey/options",
+					"/api/session/passkey/response",
 					"/api/messages/send",
 					"/api/messages/send-image",
 					"/api/messages/send-media",
@@ -178,6 +180,8 @@ func main() {
 	mux.HandleFunc("/api/status", app.handleStatus)
 	mux.HandleFunc("/api/session/connect", app.handleConnect)
 	mux.HandleFunc("/api/session/qr", app.handleGetQR)
+	mux.HandleFunc("/api/session/passkey/options", app.handlePasskeyOptions)
+	mux.HandleFunc("/api/session/passkey/response", app.handlePasskeyResponse)
 	mux.HandleFunc("/api/session/disconnect", app.handleDisconnect)
 	mux.HandleFunc("/api/session/logout", app.handleLogout)
 	mux.HandleFunc("/api/messages/send", app.handleSendMessage)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -53,6 +54,10 @@ type AgentSession struct {
 	container *sqlstore.Container
 	client    *whatsmeow.Client
 	qrCode    string
+	// Llave de un solo uso. No se guarda en disco ni en Supabase.
+	passkeyCode  string
+	passkeySkip  bool
+	passkeyReady bool
 	connected bool
 	messages  []MessageEvent
 	rawMedia  map[string]*waE2E.Message
@@ -679,10 +684,36 @@ func (s *AgentSession) eventHandler(evt interface{}) {
 	case *events.Connected:
 		s.handleConnected()
 
+	case *events.PairPasskeyConfirmation:
+		// SkipHandoffUX true: el canal QR de whatsmeow confirma solo.
+		// false: hay que llamar SendPasskeyConfirmation.
+		s.mu.Lock()
+		s.passkeyCode = v.Code
+		s.passkeySkip = v.SkipHandoffUX
+		s.passkeyReady = true
+		client := s.client
+		s.mu.Unlock()
+		fmt.Printf("… [%s] passkey confirmation skip=%v\n", s.AgentCode, v.SkipHandoffUX)
+		if v.SkipHandoffUX || client == nil {
+			return
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+			defer cancel()
+			if err := client.SendPasskeyConfirmation(ctx); err != nil {
+				fmt.Printf("✗ [%s] SendPasskeyConfirmation: %v\n", s.AgentCode, err)
+			}
+		}()
+
+	case *events.PairPasskeyError:
+		fmt.Printf("✗ [%s] passkey: %v\n", s.AgentCode, v.Error)
+
 	case *events.PairSuccess:
 		// Pairing nuevo: Store.ID ya existe. No toca sesiones ajenas.
 		s.mu.Lock()
 		s.qrCode = ""
+		s.passkeyCode = ""
+		s.passkeyReady = false
 		phone := v.ID.User
 		if s.isLoggedInLocked() {
 			s.connected = true
@@ -1061,10 +1092,67 @@ func (s *AgentSession) Connect() (needsQR bool, err error) {
 	return false, err
 }
 
+var (
+	errPasskeyYaEmparejada = errors.New("sesión ya emparejada")
+	errPasskeySinSocket    = errors.New("socket de emparejamiento no está listo")
+)
+
 func (s *AgentSession) GetQR() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.qrCode
+}
+
+// RequestPasskeyOptions pide un challenge nuevo. No llama a Connect y no toca
+// una sesión que ya tiene device. Si falla, el QR de siempre sigue.
+func (s *AgentSession) RequestPasskeyOptions(ctx context.Context) (*types.WebAuthnPublicKey, error) {
+	s.mu.Lock()
+	client := s.client
+	loggedIn := s.isLoggedInLocked()
+	live := client != nil && client.IsConnected()
+	s.passkeyCode = ""
+	s.passkeyReady = false
+	s.mu.Unlock()
+	if loggedIn || (client != nil && client.Store != nil && client.Store.ID != nil) {
+		return nil, errPasskeyYaEmparejada
+	}
+	if client == nil || !live {
+		return nil, errPasskeySinSocket
+	}
+	return client.DangerousInternals().GetPasskeyRequestOptions(ctx)
+}
+
+func (s *AgentSession) SendPasskey(ctx context.Context, resp *types.WebAuthnResponse) error {
+	s.mu.Lock()
+	client := s.client
+	loggedIn := s.isLoggedInLocked()
+	s.passkeyCode = ""
+	s.passkeyReady = false
+	s.mu.Unlock()
+	if loggedIn || client == nil || (client.Store != nil && client.Store.ID != nil) {
+		return errPasskeyYaEmparejada
+	}
+	if !client.IsConnected() {
+		return errPasskeySinSocket
+	}
+	return client.SendPasskeyResponse(ctx, resp)
+}
+
+func (s *AgentSession) WaitPasskeyOutcome(timeout time.Duration) (code string, skip bool, ready bool) {
+	deadline := time.Now().Add(timeout)
+	for {
+		s.mu.RLock()
+		code, skip, ready = s.passkeyCode, s.passkeySkip, s.passkeyReady
+		loggedIn := s.isLoggedInLocked()
+		s.mu.RUnlock()
+		if ready || loggedIn {
+			return code, skip, true
+		}
+		if time.Now().After(deadline) {
+			return "", false, false
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 func (s *AgentSession) Disconnect() {

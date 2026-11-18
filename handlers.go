@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -188,6 +190,176 @@ func (app *App) handleConnect(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, APIResponse{Success: true, Message: msg, Data: data})
+}
+
+func (app *App) handlePasskeyOptions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Success: false, Message: "POST required"})
+		return
+	}
+	code, s, ok := app.passkeySession(w, r)
+	if !ok {
+		return
+	}
+	if s.StatusInfo().HasSession {
+		writeJSON(w, http.StatusConflict, APIResponse{
+			Success: false,
+			Message: "La sesión ya está emparejada",
+			Data:    map[string]interface{}{"passkey": false, "has_session": true, "agent_code": code},
+		})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	pub, err := s.RequestPasskeyOptions(ctx)
+	if errors.Is(err, errPasskeyYaEmparejada) {
+		writeJSON(w, http.StatusConflict, APIResponse{
+			Success: false,
+			Message: "La sesión ya está emparejada",
+			Data:    map[string]interface{}{"passkey": false, "has_session": true, "agent_code": code},
+		})
+		return
+	}
+	if err != nil {
+		fmt.Printf("… [%s] sin llave, sigue el QR: %v\n", code, err)
+		writeJSON(w, http.StatusOK, APIResponse{
+			Success: true,
+			Message: "Esta cuenta sigue con el QR.",
+			Data:    map[string]interface{}{"passkey": false, "agent_code": code},
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Data: map[string]interface{}{
+			"passkey":    true,
+			"agent_code": code,
+			"publicKey":  pub,
+		},
+	})
+}
+
+func (app *App) handlePasskeyResponse(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, APIResponse{Success: false, Message: "POST required"})
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "Body inválido"})
+		return
+	}
+	code, s, ok := app.passkeySessionFromBody(w, r, body)
+	if !ok {
+		return
+	}
+	if s.StatusInfo().HasSession {
+		writeJSON(w, http.StatusConflict, APIResponse{
+			Success: false,
+			Message: "La sesión ya está emparejada",
+			Data:    map[string]interface{}{"has_session": true, "agent_code": code},
+		})
+		return
+	}
+	raw := passkeyAssertionJSON(body)
+	var resp types.WebAuthnResponse
+	if err := json.Unmarshal(raw, &resp); err != nil || len(resp.RawID) == 0 || len(resp.Response.Signature) == 0 {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "WebAuthnResponse inválido"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+	err = s.SendPasskey(ctx, &resp)
+	cancel()
+	if errors.Is(err, errPasskeyYaEmparejada) {
+		writeJSON(w, http.StatusConflict, APIResponse{
+			Success: false,
+			Message: "La sesión ya está emparejada",
+			Data:    map[string]interface{}{"has_session": true, "agent_code": code},
+		})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusConflict, APIResponse{
+			Success: false,
+			Message: "La firma no sirvió. Pedí una llave nueva: el challenge es de un solo uso.",
+			Data:    map[string]interface{}{"retry": true, "agent_code": code},
+		})
+		return
+	}
+	passkeyCode, skip, ready := s.WaitPasskeyOutcome(8 * time.Second)
+	data := map[string]interface{}{"agent_code": code, "accepted": true}
+	msg := "Firma enviada. Si no vincula en un momento, pedí otra llave."
+	if ready && passkeyCode != "" && !skip {
+		data["code"] = passkeyCode
+		data["skip_handoff"] = false
+		msg = "Confirmá en el teléfono el código " + passkeyCode
+	} else if ready && skip {
+		data["skip_handoff"] = true
+		msg = "WhatsApp confirmó la llave. El vínculo sigue solo."
+	}
+	writeJSON(w, http.StatusOK, APIResponse{Success: true, Message: msg, Data: data})
+}
+
+func (app *App) passkeySession(w http.ResponseWriter, r *http.Request) (string, *AgentSession, bool) {
+	var req struct {
+		AgentCode string `json:"agent_code"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.AgentCode == "" {
+		req.AgentCode = agentCodeFromQuery(r)
+	}
+	if req.AgentCode == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "agent_code is required"})
+		return "", nil, false
+	}
+	s, ok := app.manager.GetSession(req.AgentCode)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Message: "Session not found"})
+		return "", nil, false
+	}
+	return req.AgentCode, s, true
+}
+
+func (app *App) passkeySessionFromBody(w http.ResponseWriter, r *http.Request, body []byte) (string, *AgentSession, bool) {
+	var req struct {
+		AgentCode string `json:"agent_code"`
+	}
+	_ = json.Unmarshal(body, &req)
+	if req.AgentCode == "" {
+		req.AgentCode = agentCodeFromQuery(r)
+	}
+	if req.AgentCode == "" {
+		writeJSON(w, http.StatusBadRequest, APIResponse{Success: false, Message: "agent_code is required"})
+		return "", nil, false
+	}
+	s, ok := app.manager.GetSession(req.AgentCode)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, APIResponse{Success: false, Message: "Session not found"})
+		return "", nil, false
+	}
+	return req.AgentCode, s, true
+}
+
+func passkeyAssertionJSON(body []byte) json.RawMessage {
+	var probe struct {
+		Response json.RawMessage `json:"response"`
+		RawID    json.RawMessage `json:"rawId"`
+	}
+	if json.Unmarshal(body, &probe) != nil {
+		return body
+	}
+	if len(probe.RawID) > 0 && string(probe.RawID) != "null" {
+		return body
+	}
+	if len(probe.Response) > 0 && string(probe.Response) != "null" {
+		var inner struct {
+			RawID json.RawMessage `json:"rawId"`
+		}
+		if json.Unmarshal(probe.Response, &inner) == nil && len(inner.RawID) > 0 && string(inner.RawID) != "null" {
+			return probe.Response
+		}
+	}
+	return body
 }
 
 func (app *App) handleGetQR(w http.ResponseWriter, r *http.Request) {

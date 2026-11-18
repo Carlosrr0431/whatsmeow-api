@@ -6,7 +6,8 @@ WORKDIR /app
 
 COPY . .
 ENV GOTOOLCHAIN=auto
-RUN go get go.mau.fi/whatsmeow@latest && \
+# Posterior a julio 2026: incluye pair-passkey.go (tulir/whatsmeow #1186). Sin fork.
+RUN go get go.mau.fi/whatsmeow@19d61352436f3aeb21ad2cf93c2e3599ac409415 && \
     go get github.com/mattn/go-sqlite3@latest && \
     go get github.com/skip2/go-qrcode@latest && \
     go get google.golang.org/protobuf@latest && \
